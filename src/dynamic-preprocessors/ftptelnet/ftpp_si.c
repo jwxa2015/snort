@@ -1,7 +1,7 @@
 /*
  * ftpp_si.c
  *
- * Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+ * Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
  * Copyright (C) 2004-2013 Sourcefire, Inc.
  * Steven A. Sturges <ssturges@sourcefire.com>
  * Daniel J. Roelker <droelker@sourcefire.com>
@@ -57,9 +57,11 @@
 #include "ftpp_ui_client_lookup.h"
 #include "ftpp_ui_server_lookup.h"
 #include "ftpp_si.h"
+#include "spp_ftptelnet.h"
 #include "stream_api.h"
 #include "snort_ftptelnet.h"
 #include "sfPolicyUserData.h"
+#include "ssl_include.h"
 
 #ifndef WIN32
 # include <ctype.h>
@@ -125,6 +127,9 @@ static void TelnetFreeSession(void *preproc_session)
         }
     }
 
+    ftp_telnet_stats.telnet_sessions--;
+    ftp_telnet_stats.heap_memory -= sizeof(TELNET_SESSION);
+
     free(ssn);
 }
 
@@ -180,10 +185,17 @@ static int TelnetStatefulSessionInspection(SFSnortPacket *p,
         TELNET_SESSION **TelnetSession,
         FTPP_SI_INPUT *SiInput)
 {
-    if (p->stream_session_ptr)
+    if (p->stream_session)
     {
         TELNET_SESSION *NewSession = (TELNET_SESSION *)calloc(1, sizeof(TELNET_SESSION));
-        tSfPolicyId policy_id = _dpd.getRuntimePolicy();
+
+        ftp_telnet_stats.telnet_sessions++;
+        if (ftp_telnet_stats.telnet_sessions > ftp_telnet_stats.max_telnet_sessions)
+            ftp_telnet_stats.max_telnet_sessions = ftp_telnet_stats.telnet_sessions;
+
+        ftp_telnet_stats.heap_memory += sizeof(TELNET_SESSION); 
+
+        tSfPolicyId policy_id = _dpd.getNapRuntimePolicy();
 
         if (NewSession == NULL)
         {
@@ -202,7 +214,7 @@ static int TelnetStatefulSessionInspection(SFSnortPacket *p,
 
         SiInput->pproto = FTPP_SI_PROTO_TELNET;
 
-        _dpd.streamAPI->set_application_data(p->stream_session_ptr,
+        _dpd.sessionAPI->set_application_data(p->stream_session,
                 PP_FTPTELNET, NewSession, &TelnetFreeSession);
 
         *TelnetSession = NewSession;
@@ -300,7 +312,7 @@ int TelnetSessionInspection(SFSnortPacket *p, FTPTELNET_GLOBAL_CONF *GlobalConf,
     /* If possible, use Stream API to determine protocol. */
     if (_dpd.streamAPI)
     {
-        app_id = _dpd.streamAPI->get_application_protocol_id(p->stream_session_ptr);
+        app_id = _dpd.sessionAPI->get_application_protocol_id(p->stream_session);
     }
     if (app_id == SFTARGET_UNKNOWN_PROTOCOL)
     {
@@ -443,21 +455,12 @@ static int FTPInitConf(SFSnortPacket *p, FTPTELNET_GLOBAL_CONF *GlobalConf,
 #ifdef TARGET_BASED
     int16_t app_id = 0;
 #endif
-    snort_ip sip;
-    snort_ip dip;
+    sfaddr_t sip;
+    sfaddr_t dip;
 
     //structure copy
     sip = SiInput->sip;
     dip = SiInput->dip;
-
-    if (sip.family == AF_INET)
-    {
-        sip.ip.u6_addr32[0] = ntohl(sip.ip.u6_addr32[0]);
-    }
-    if (dip.family == AF_INET)
-    {
-        dip.ip.u6_addr32[0] = ntohl(dip.ip.u6_addr32[0]);
-    }
 
     /*
      * We find the client configurations for both the source and dest IPs.
@@ -537,7 +540,7 @@ static int FTPInitConf(SFSnortPacket *p, FTPTELNET_GLOBAL_CONF *GlobalConf,
         case FTPP_SI_NO_MODE:
 
 #ifdef TARGET_BASED
-            app_id = _dpd.streamAPI->get_application_protocol_id(p->stream_session_ptr);
+            app_id = _dpd.sessionAPI->get_application_protocol_id(p->stream_session);
 
             if (app_id == ftp_app_id || app_id == 0)
             {
@@ -603,7 +606,7 @@ static int FTPInitConf(SFSnortPacket *p, FTPTELNET_GLOBAL_CONF *GlobalConf,
         case FTPP_SI_CLIENT_MODE:
             /* Packet is from client --> dest is Server */
 #ifdef TARGET_BASED
-            app_id = _dpd.streamAPI->get_application_protocol_id(p->stream_session_ptr);
+            app_id = _dpd.sessionAPI->get_application_protocol_id(p->stream_session);
 
             if ((app_id == ftp_app_id) || (!app_id && iServerDip))
 #else
@@ -625,7 +628,7 @@ static int FTPInitConf(SFSnortPacket *p, FTPTELNET_GLOBAL_CONF *GlobalConf,
         case FTPP_SI_SERVER_MODE:
             /* Packet is from server --> src is Server */
 #ifdef TARGET_BASED
-            app_id = _dpd.streamAPI->get_application_protocol_id(p->stream_session_ptr);
+            app_id = _dpd.sessionAPI->get_application_protocol_id(p->stream_session);
 
             if ((app_id == ftp_app_id) || (!app_id && iServerSip))
 #else
@@ -667,6 +670,7 @@ static void FTPFreeSession(void *preproc_session)
 {
     FTP_SESSION *ssn = (FTP_SESSION *)preproc_session;
     FTPTELNET_GLOBAL_CONF *pPolicyConfig = NULL;
+    ssl_callback_interface_t *ssl_cb = (ssl_callback_interface_t *)_dpd.getSSLCallback();
 
     if (ssn == NULL)
         return;
@@ -690,10 +694,21 @@ static void FTPFreeSession(void *preproc_session)
 
     if (ssn->filename)
     {
+        ftp_telnet_stats.heap_memory -= (strlen(ssn->filename) + 1);
         free(ssn->filename);
     }
 
+    if ( ssl_cb )
+        ssl_cb->session_free(ssn->flow_id);
+
+    ftp_telnet_stats.ftp_sessions--;
+    ftp_telnet_stats.heap_memory -= sizeof(FTP_SESSION);
+#ifdef TARGET_BASED
+    FTP_DATA_SESSION *datassn = ssn->datassn;
+    if(datassn && (ssn == datassn->ftpssn))
+        datassn->ftpssn = NULL;
     free(ssn);
+#endif
 }
 
 #ifdef TARGET_BASED
@@ -709,20 +724,28 @@ FTP_DATA_SESSION * FTPDataSessionNew(SFSnortPacket *p)
         return NULL;
 
     ftpdata->ft_ssn.proto = FTPP_SI_PROTO_FTP_DATA;
+    ftpdata->flow_id = 0;
 
     /* Get the ftp-ctrl session key */
-    ftpdata->ftp_key = _dpd.streamAPI->get_session_key(p);
+    ftpdata->ftp_key = _dpd.sessionAPI->get_session_key(p);
 
     if (!ftpdata->ftp_key)
     {
         free(ftpdata);
         ftpdata = NULL;
+        return ftpdata;
     }
+
+    ftp_telnet_stats.ftp_data_sessions++;
+    if (ftp_telnet_stats.ftp_data_sessions > ftp_telnet_stats.max_ftp_data_sessions)
+        ftp_telnet_stats.max_ftp_data_sessions = ftp_telnet_stats.ftp_data_sessions;
+    
+    ftp_telnet_stats.heap_memory += (sizeof (*ftpdata) + sizeof(StreamSessionKey));
 
     return ftpdata;
 }
 
-/* 
+/*
  * Function: FTPDataSessionFree
  *
  * Free an ftp-data session
@@ -730,9 +753,14 @@ FTP_DATA_SESSION * FTPDataSessionNew(SFSnortPacket *p)
 void FTPDataSessionFree(void *p_ssn)
 {
     FTP_DATA_SESSION *ssn = (FTP_DATA_SESSION *)p_ssn;
+    ssl_callback_interface_t *ssl_cb = (ssl_callback_interface_t *)_dpd.getSSLCallback();
 
     if (!ssn)
         return;
+
+    FTP_SESSION * ftpssn = ssn->ftpssn;
+    if(ftpssn && (ssn == ftpssn->datassn))
+        ftpssn->datassn = NULL;
 
     /* ftp-data key shouldn't exist without this but */
     if (ssn->ftp_key)
@@ -742,8 +770,15 @@ void FTPDataSessionFree(void *p_ssn)
 
     if (ssn->filename)
     {
+        ftp_telnet_stats.heap_memory -= (strlen(ssn->filename) + 1);
         free(ssn->filename);
     }
+
+    if ( ssl_cb )
+        ssl_cb->session_free(ssn->flow_id);
+
+    ftp_telnet_stats.ftp_data_sessions--;
+    ftp_telnet_stats.heap_memory -= sizeof(FTP_DATA_SESSION);
 
     free(ssn);
 }
@@ -756,7 +791,7 @@ void FTPDataSessionFree(void *p_ssn)
 bool FTPDataDirection(SFSnortPacket *p, FTP_DATA_SESSION *ftpdata)
 {
     uint32_t direction;
-    uint32_t pktdir = _dpd.streamAPI->get_packet_direction(p); 
+    uint32_t pktdir = _dpd.sessionAPI->get_packet_direction(p);
 
     if (ftpdata->mode == FTPP_XFER_ACTIVE)
         direction = ftpdata->direction ?  FLAG_FROM_SERVER : FLAG_FROM_CLIENT;
@@ -796,13 +831,17 @@ static inline int FTPResetSession(FTP_SESSION *FtpSession)
     FtpSession->global_conf = NULL;
 
     FtpSession->encr_state = NO_STATE;
+    FtpSession->encr_state_chello = false;
+    FtpSession->flow_id = 0;
     IP_CLEAR(FtpSession->clientIP);
     FtpSession->clientPort = 0;
     IP_CLEAR(FtpSession->serverIP);
     FtpSession->serverPort = 0;
     FtpSession->data_chan_state = NO_STATE;
-    FtpSession->data_chan_index = -1;
-    FtpSession->data_xfer_index = -1;
+    FtpSession->data_chan_index = 0;
+    FtpSession->data_xfer_index = 0;
+    FtpSession->ftp_cmd_pipe_index = 1;
+    FtpSession->rest_cmd_offset = 0;
 
     FtpSession->event_list.stack_count = 0;
 
@@ -835,7 +874,7 @@ static int FTPStatefulSessionInspection(SFSnortPacket *p,
         FTP_SESSION **FtpSession,
         FTPP_SI_INPUT *SiInput, int *piInspectMode)
 {
-    if (p->stream_session_ptr)
+    if (p->stream_session)
     {
         FTP_CLIENT_PROTO_CONF *ClientConf;
         FTP_SERVER_PROTO_CONF *ServerConf;
@@ -848,7 +887,14 @@ static int FTPStatefulSessionInspection(SFSnortPacket *p,
         if (*piInspectMode)
         {
             FTP_SESSION *NewSession = (FTP_SESSION *)calloc(1, sizeof(FTP_SESSION));
-            tSfPolicyId policy_id = _dpd.getRuntimePolicy();
+
+            ftp_telnet_stats.ftp_sessions++;
+            if (ftp_telnet_stats.ftp_sessions > ftp_telnet_stats.max_ftp_sessions)
+                ftp_telnet_stats.max_ftp_sessions = ftp_telnet_stats.ftp_sessions;
+   
+            ftp_telnet_stats.heap_memory += sizeof(FTP_SESSION);
+
+            tSfPolicyId policy_id = _dpd.getNapRuntimePolicy();
 
             if (NewSession == NULL)
             {
@@ -866,8 +912,8 @@ static int FTPStatefulSessionInspection(SFSnortPacket *p,
             NewSession->policy_id = policy_id;
             GlobalConf->ref_count++;
 
-            _dpd.streamAPI->set_application_data
-                (p->stream_session_ptr, PP_FTPTELNET, NewSession, &FTPFreeSession);
+            _dpd.sessionAPI->set_application_data
+                (p->stream_session, PP_FTPTELNET, NewSession, &FTPFreeSession);
 
             *FtpSession = NewSession;
             SiInput->pproto = FTPP_SI_PROTO_FTP;

@@ -1,6 +1,6 @@
 /****************************************************************************
  *
- * Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+ * Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
  * Copyright (C) 2003-2013 Sourcefire, Inc.
  *
  * This program is free software; you can redistribute it and/or modify
@@ -54,11 +54,12 @@ typedef struct _hi_stats {
     uint64_t resp_cookie_len;
 #endif
     uint64_t total;
-#ifdef ZLIB
     uint64_t gzip_pkts;
     uint64_t compr_bytes_read;
     uint64_t decompr_bytes_read;
-#endif
+    uint64_t h2_rebuilt_packets;
+    uint64_t mem_used;
+    uint64_t session_count;
 } HIStats;
 
 extern HIStats hi_stats;

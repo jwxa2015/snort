@@ -3,7 +3,7 @@
 **
 ** perf-base.c
 **
-** Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+** Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
 ** Copyright (C) 2002-2013 Sourcefire, Inc.
 ** Dan Roelker <droelker@sourcefire.com>
 ** Marc Norton <mnorton@sourcefire.com>
@@ -50,6 +50,7 @@
 #endif
 #include <stdlib.h>
 #include <stdio.h>
+#include <math.h>
 #include <sys/types.h>
 
 #ifdef HAVE_CONFIG_H
@@ -61,9 +62,11 @@
 #include "util.h"
 #include "mpse.h"
 #include "sfdaq.h"
+#include "session_api.h"
 #include "stream_api.h"
 #include "sf_types.h"
 #include "snort_bounds.h"
+
 
 static void GetPktDropStats(SFBASE *, SFBASE_STATS *);
 static void DisplayBasePerfStatsConsole(SFBASE_STATS *, int);
@@ -75,6 +78,19 @@ static int GetProcessingTime(SYSTIMES *, SFBASE *);
 static void GetEventsPerSecond(SFBASE *, SFBASE_STATS *, SYSTIMES *);
 static void GetuSecondsPerPacket(SFBASE *, SFBASE_STATS *, SYSTIMES *);
 static void GetCPUTime(SFBASE *, SFBASE_STATS *, SYSTIMES *);
+
+
+//We should never output NaN or Infitity
+static inline double zeroFpException(double in)
+{
+//FIXME WIN32 -vc++6 does NOT provide the function |isnan() |  nor |isinf()| - VJR 7/22/15 
+//  (see also:http://stackoverflow.com/questions/2249110/how-do-i-make-a-portable-isnan-isinf-function)
+#ifndef WIN32
+    if (isnan(in) || isinf(in))
+        return 0.0;
+#endif
+    return in;
+}
 
 /*
 **  NAME
@@ -181,7 +197,10 @@ int InitBaseStats(SFBASE *sfBase)
     {
         int i = 0;
         for ( i = 0; i < PERF_COUNT_MAX; i++ )
-            sfBase->iPegs[i] = 0;
+        {
+            sfBase->iPegs[i][NORM_MODE_ON] = 0;
+            sfBase->iPegs[i][NORM_MODE_WOULDA] = 0;
+        }
     }
 #endif
 
@@ -376,7 +395,7 @@ void UpdateStreamReassStats(SFBASE *sfBase, int len)
  *
  * @param sfBase - pointer to accumulated stats
  */
-void UpdateFilteredPacketStats(SFBASE *sfBase, unsigned int proto)
+void UpdateFilteredPacketStats(SFBASE *sfBase, IpProto proto)
 {
     switch (proto)
     {
@@ -440,13 +459,14 @@ int CloseStreamSession(SFBASE *sfBase, char flags)
 {
     if (flags & SESSION_CLOSED_NORMALLY)
         sfBase->iClosedSessions++;
-    else if (flags & SESSION_CLOSED_TIMEDOUT)
-        sfBase->iStreamTimeouts++;
-    else if (flags & SESSION_CLOSED_PRUNED)
-        sfBase->iPrunedSessions++;
-    else if (flags & SESSION_CLOSED_ASYNC)
-        sfBase->iDroppedAsyncSessions++;
-
+    else{
+        if (flags & SESSION_CLOSED_TIMEDOUT)
+            sfBase->iStreamTimeouts++;
+        if (flags & SESSION_CLOSED_PRUNED)
+            sfBase->iPrunedSessions++;
+        if (flags & SESSION_CLOSED_ASYNC)
+            sfBase->iDroppedAsyncSessions++;
+    }
     return 0;
 }
 
@@ -533,15 +553,17 @@ void ProcessBaseStats(SFBASE *sfBase, FILE *fh, int console, int max_stats)
 {
     SFBASE_STATS sfBaseStats;
 
-    if ((fh  || console) &&
-        CalculateBasePerfStats(sfBase, &sfBaseStats, max_stats))
-        return;
+    if (fh  || console)
+    {
+        if (CalculateBasePerfStats(sfBase, &sfBaseStats, max_stats))
+            return;
 
-    if (console)
-        DisplayBasePerfStatsConsole(&sfBaseStats, max_stats);
-
-    if (fh != NULL)
-        LogBasePerfStats(&sfBaseStats, fh);
+        if (console)
+            DisplayBasePerfStatsConsole(&sfBaseStats, max_stats);
+    
+        if (fh)
+            LogBasePerfStats(&sfBaseStats, fh);
+    }
 }
 
 static int GetProcessingTime(SYSTIMES *Systimes, SFBASE *sfBase)
@@ -689,7 +711,10 @@ static void GetEventsPerSecond(SFBASE *sfBase, SFBASE_STATS *sfBaseStats,
     {
         int i = 0;
         for ( i = 0; i < PERF_COUNT_MAX; i++ )
-            sfBase->iPegs[i] = 0;
+        {
+            sfBase->iPegs[i][NORM_MODE_ON] = 0;
+            sfBase->iPegs[i][NORM_MODE_WOULDA] = 0;
+        }
     }
 #endif
 
@@ -814,14 +839,17 @@ static void GetPacketsPerSecond(SFBASE *sfBase, SFBASE_STATS *sfBaseStats,
 static void GetuSecondsPerPacket(SFBASE *sfBase, SFBASE_STATS *sfBaseStats,
         SYSTIMES *Systimes)
 {
-    sfBaseStats->usecs_per_packet.usertime   = (Systimes->usertime * 1.0e6) /
-                                               (double)sfBase->total_packets;
-    sfBaseStats->usecs_per_packet.systemtime = (Systimes->systemtime * 1.0e6) /
-                                               (double)sfBase->total_packets;
-    sfBaseStats->usecs_per_packet.totaltime  = (Systimes->totaltime * 1.0e6) /
-                                               (double)sfBase->total_packets;
-    sfBaseStats->usecs_per_packet.realtime   = (Systimes->realtime * 1.0e6) /
-                                               (double)sfBase->total_packets;
+    if(sfBase->total_packets)
+    {
+        sfBaseStats->usecs_per_packet.usertime   = (Systimes->usertime * 1.0e6) /
+            (double)sfBase->total_packets;
+        sfBaseStats->usecs_per_packet.systemtime = (Systimes->systemtime * 1.0e6) /
+            (double)sfBase->total_packets;
+        sfBaseStats->usecs_per_packet.totaltime  = (Systimes->totaltime * 1.0e6) /
+            (double)sfBase->total_packets;
+        sfBaseStats->usecs_per_packet.realtime   = (Systimes->realtime * 1.0e6) /
+            (double)sfBase->total_packets;
+    }
 }
 
 static void GetMbitsPerSecond(SFBASE *sfBase, SFBASE_STATS *sfBaseStats,
@@ -986,7 +1014,10 @@ static int CalculateBasePerfStats(SFBASE *sfBase, SFBASE_STATS *sfBaseStats, int
     {
         int iCtr;
         for ( iCtr = 0; iCtr < PERF_COUNT_MAX; iCtr++ )
-            sfBaseStats->pegs[iCtr] = sfBase->iPegs[iCtr];
+        {
+            sfBaseStats->pegs[iCtr][NORM_MODE_ON] = sfBase->iPegs[iCtr][NORM_MODE_ON];
+            sfBaseStats->pegs[iCtr][NORM_MODE_WOULDA] = sfBase->iPegs[iCtr][NORM_MODE_WOULDA];
+        }
     }
 #endif
 
@@ -994,44 +1025,44 @@ static int CalculateBasePerfStats(SFBASE *sfBase, SFBASE_STATS *sfBaseStats, int
     **  Avg. bytes per Packet
     */
     if (sfBase->total_packets > 0)
-        sfBaseStats->avg_bytes_per_packet =
+        sfBaseStats->avg_bytes_per_packet = zeroFpException(
                 (int)((double)(sfBase->total_bytes) /
-                (double)(sfBase->total_packets));
+                (double)(sfBase->total_packets)));
     else
         sfBaseStats->avg_bytes_per_packet = 0;
 
     if (sfBase->total_wire_packets > 0)
-        sfBaseStats->avg_bytes_per_wire_packet =
+        sfBaseStats->avg_bytes_per_wire_packet = zeroFpException(
                 (int)((double)(sfBase->total_wire_bytes) /
-                (double)(sfBase->total_wire_packets));
+                (double)(sfBase->total_wire_packets)));
     else
         sfBaseStats->avg_bytes_per_wire_packet = 0;
 
     if (sfBase->total_ipfragmented_packets > 0)
-        sfBaseStats->avg_bytes_per_ipfrag_packet =
+        sfBaseStats->avg_bytes_per_ipfrag_packet = zeroFpException(
                 (int)((double)(sfBase->total_ipfragmented_bytes) /
-                (double)(sfBase->total_ipfragmented_packets));
+                (double)(sfBase->total_ipfragmented_packets)));
     else
         sfBaseStats->avg_bytes_per_ipfrag_packet = 0;
 
     if (sfBase->total_ipreassembled_packets > 0)
-        sfBaseStats->avg_bytes_per_ipreass_packet =
+        sfBaseStats->avg_bytes_per_ipreass_packet = zeroFpException(
                 (int)((double)(sfBase->total_ipreassembled_bytes) /
-                (double)(sfBase->total_ipreassembled_packets));
+                (double)(sfBase->total_ipreassembled_packets)));
     else
         sfBaseStats->avg_bytes_per_ipreass_packet = 0;
 
     if (sfBase->total_rebuilt_packets > 0)
-        sfBaseStats->avg_bytes_per_rebuilt_packet =
+        sfBaseStats->avg_bytes_per_rebuilt_packet = zeroFpException(
                 (int)((double)(sfBase->total_rebuilt_bytes) /
-                (double)(sfBase->total_rebuilt_packets));
+                (double)(sfBase->total_rebuilt_packets)));
     else
         sfBaseStats->avg_bytes_per_rebuilt_packet = 0;
 
     if (sfBase->total_mpls_packets > 0)
-        sfBaseStats->avg_bytes_per_mpls_packet =
+        sfBaseStats->avg_bytes_per_mpls_packet = zeroFpException(
                 (int)((double)(sfBase->total_mpls_bytes) /
-                (double)(sfBase->total_mpls_packets));
+                (double)(sfBase->total_mpls_packets)));
     else
         sfBaseStats->avg_bytes_per_mpls_packet = 0;
 
@@ -1053,8 +1084,8 @@ static int CalculateBasePerfStats(SFBASE *sfBase, SFBASE_STATS *sfBaseStats, int
     /*
     *   Pattern Matching Performance in Real and User time
     */
-    sfBaseStats->patmatch_percent = 100.0 * mpseGetPatByteCount() /
-                                    sfBase->total_wire_bytes;
+    sfBaseStats->patmatch_percent = zeroFpException(100.0 * mpseGetPatByteCount() /
+                                    sfBase->total_wire_bytes);
 
     mpseResetByteCount();
 
@@ -1138,9 +1169,8 @@ static void GetPktDropStats(SFBASE *sfBase, SFBASE_STATS *sfBaseStats)
     else
     {
         const DAQ_Stats_t* ps = DAQ_GetStats();
-        recv = ps->packets_received;
+        recv = ps->hw_packets_received;
         drop = ps->hw_packets_dropped;
-
         if (perfmon_config->base_reset)
         {
             if (recv < sfBase->pkt_stats.pkts_recv)
@@ -1169,8 +1199,8 @@ static void GetPktDropStats(SFBASE *sfBase, SFBASE_STATS *sfBaseStats)
         sfBaseStats->pkt_drop_percent = 0.0;
 
     else
-        sfBaseStats->pkt_drop_percent =
-            ((double)sfBaseStats->pkt_stats.pkts_drop / (double)sum) * 100.0;
+        sfBaseStats->pkt_drop_percent = zeroFpException(
+            ((double)sfBaseStats->pkt_stats.pkts_drop / (double)sum) * 100.0);
 
     /*
     **  Reset sfBase stats for next go round.
@@ -1408,9 +1438,15 @@ static void LogBasePerfStats(SFBASE_STATS *sfBaseStats,  FILE * fh )
         sfBaseStats->total_udp_filtered_packets);
 
 #ifdef NORMALIZER
+    size += SafeSnprintf(buff + size, sizeof(buff) - size, 
+        "%d,",
+        PERF_COUNT_MAX);
     for ( iCtr = 0; iCtr < PERF_COUNT_MAX; iCtr++ )
         size += SafeSnprintf(buff + size, sizeof(buff) - size, 
-            CSVu64, sfBaseStats->pegs[iCtr]);
+            CSVu64, sfBaseStats->pegs[iCtr][NORM_MODE_ON]);
+    for ( iCtr = 0; iCtr < PERF_COUNT_MAX; iCtr++ )
+        size += SafeSnprintf(buff + size, sizeof(buff) - size, 
+            CSVu64, sfBaseStats->pegs[iCtr][NORM_MODE_WOULDA]);
 #endif
 
     size += SafeSnprintf(buff + size, sizeof(buff) - size, 
@@ -1433,7 +1469,10 @@ static void LogBasePerfStats(SFBASE_STATS *sfBaseStats,  FILE * fh )
         WarningMessage("%s: Failed to write stats\n", __FUNCTION__);
 
         // fseek to adjust offset; ftruncate doesn't do that for us.
-        fseek(fh, start, SEEK_SET);
+        if (fseek(fh, start, SEEK_SET))
+        {
+            WarningMessage("%s: Failed to adjust offset\n", __FUNCTION__);
+        }
         ftruncate(fileno(fh), start);
     }
 
@@ -1457,15 +1496,20 @@ static const char* iNames[PERF_COUNT_MAX] = {
     "tcp::pad",
     "tcp::rsv",
     "tcp::ns",
-    "tcp::urg",
     "tcp::urp",
-    "tcp::trim",
     "tcp::ecn_pkt",
     "tcp::ecn_ssn",
     "tcp::ts_ecr",
     "tcp::ts_nop",
     "tcp::ips_data",
-    "tcp::block"
+    "tcp::block",
+    "tcp::req_urg",
+    "tcp::req_pay",
+    "tcp::req_urp",
+    "tcp::trim_syn",
+    "tcp::trim_rst",
+    "tcp::trim_win",
+    "tcp::trim_mss",
 };
 #endif
 
@@ -1601,8 +1645,11 @@ void LogBasePerfHeader (FILE* fh)
         "total_udp_filtered_packets");
 
 #ifdef NORMALIZER
+    fprintf(fh, ",num_normalizations");
     for ( iCtr = 0; iCtr < PERF_COUNT_MAX; iCtr++ )
         fprintf(fh, ",%s", iNames[iCtr]);
+    for ( iCtr = 0; iCtr < PERF_COUNT_MAX; iCtr++ )
+        fprintf(fh, ",would_%s", iNames[iCtr]);
 #endif
 
     fprintf(fh,
@@ -1782,9 +1829,14 @@ static void DisplayBasePerfStatsConsole(SFBASE_STATS *sfBaseStats, int max_stats
 #endif
 
 #ifdef NORMALIZER
+    LogMessage("Number of Normalizations  :  %d\n", PERF_COUNT_MAX);
     for ( iCtr = 0; iCtr < PERF_COUNT_MAX; iCtr++ )
+    {
         LogMessage("%-26s:  " STDu64 "\n",
-            iNames[iCtr], sfBaseStats->pegs[iCtr]);
+            iNames[iCtr], sfBaseStats->pegs[iCtr][NORM_MODE_ON]);
+        LogMessage("Would %-20s:  " STDu64 "\n",
+            iNames[iCtr], sfBaseStats->pegs[iCtr][NORM_MODE_WOULDA]);
+    }
 #endif
     LogMessage("\n");
 
@@ -1823,4 +1875,5 @@ static void DisplayBasePerfStatsConsole(SFBASE_STATS *sfBaseStats, int max_stats
         LogMessage("Combined:    %.3f\n\n",sfBaseStats->kpackets_per_sec.totaltime);
     }
 }
+
 

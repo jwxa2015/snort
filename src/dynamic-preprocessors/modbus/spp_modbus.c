@@ -14,7 +14,7 @@
  * along with this program; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
  *
- * Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+ * Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
  * Copyright (C) 2011-2013 Sourcefire, Inc.
  *
  * Author: Ryan Jordan
@@ -51,6 +51,9 @@ PreprocStats modbusPerfStats;
 #include "modbus_roptions.h"
 #include "modbus_paf.h"
 
+#ifdef DUMP_BUFFER
+#include "modbus_buffer_dump.h"
+#endif
 const int MAJOR_VERSION = 1;
 const int MINOR_VERSION = 1;
 const int BUILD_VERSION = 1;
@@ -82,9 +85,11 @@ static void * ModbusReloadSwap(struct _SnortConfig *, void *);
 static void ModbusReloadSwapFree(void *);
 #endif
 
-static void _addPortsToStream5Filter(struct _SnortConfig *, modbus_config_t *, tSfPolicyId);
+static void registerPortsForDispatch( struct _SnortConfig *sc, modbus_config_t *policy );
+static void registerPortsForReassembly( modbus_config_t *policy, int direction );
+static void _addPortsToStreamFilter(struct _SnortConfig *, modbus_config_t *, tSfPolicyId);
 #ifdef TARGET_BASED
-static void _addServicesToStream5Filter(struct _SnortConfig *, tSfPolicyId);
+static void _addServicesToStreamFilter(struct _SnortConfig *, tSfPolicyId);
 #endif
 
 static void ModbusFreeConfig(tSfPolicyUserContextId context_id);
@@ -108,12 +113,26 @@ void SetupModbus(void)
                          ModbusReloadVerify, ModbusReloadSwap,
                          ModbusReloadSwapFree);
 #endif
+#ifdef DUMP_BUFFER
+    _dpd.registerBufferTracer(getMODBUSBuffers, MODBUS_BUFFER_DUMP_FUNC);
+#endif
 }
+
+#ifdef REG_TEST
+static inline void PrintMODBUSSize(void)
+{
+    _dpd.logMsg("\nMODBUS Session Size: %lu\n", (long unsigned int)sizeof(modbus_session_data_t));
+}
+#endif
 
 /* Allocate memory for preprocessor config, parse the args, set up callbacks */
 static void ModbusInit(struct _SnortConfig *sc, char *argp)
 {
     modbus_config_t *modbus_policy = NULL;
+
+#ifdef REG_TEST
+    PrintMODBUSSize();
+#endif
 
     if (modbus_context_id == NULL)
     {
@@ -129,8 +148,14 @@ static void ModbusInit(struct _SnortConfig *sc, char *argp)
 #ifdef TARGET_BASED
     ModbusAddServiceToPaf(sc, modbus_app_id, _dpd.getParserPolicy(sc));
 #endif
+    // register ports with session and stream
+    registerPortsForDispatch( sc, modbus_policy );
+    registerPortsForReassembly( modbus_policy, SSN_DIR_FROM_SERVER | SSN_DIR_FROM_CLIENT );
 
     ModbusPrintConfig(modbus_policy);
+#ifdef DUMP_BUFFER
+        dumpBufferInit();
+#endif
 }
 
 static inline void ModbusOneTimeInit(struct _SnortConfig *sc)
@@ -154,7 +179,7 @@ static inline void ModbusOneTimeInit(struct _SnortConfig *sc)
     _dpd.addPreprocExit(ModbusCleanExit, NULL, PRIORITY_LAST, PP_MODBUS);
 
 #ifdef PERF_PROFILING
-    _dpd.addPreprocProfileFunc("modbus", (void *)&modbusPerfStats, 0, _dpd.totalPerfStats);
+    _dpd.addPreprocProfileFunc("modbus", (void *)&modbusPerfStats, 0, _dpd.totalPerfStats, NULL);
 #endif
 
     /* Set up target-based app id */
@@ -162,6 +187,10 @@ static inline void ModbusOneTimeInit(struct _SnortConfig *sc)
     modbus_app_id = _dpd.findProtocolReference("modbus");
     if (modbus_app_id == SFTARGET_UNKNOWN_PROTOCOL)
         modbus_app_id = _dpd.addProtocolReference("modbus");
+
+    // register with session to handle applications
+    _dpd.sessionAPI->register_service_handler( PP_MODBUS, modbus_app_id );
+
 #endif
 }
 
@@ -193,9 +222,9 @@ static inline modbus_config_t * ModbusPerPolicyInit(struct _SnortConfig *sc, tSf
 
     /* Register callbacks that are done for each policy */
     _dpd.addPreproc(sc, ProcessModbus, PRIORITY_APPLICATION, PP_MODBUS, PROTO_BIT__TCP);
-    _addPortsToStream5Filter(sc, modbus_policy, policy_id);
+   _addPortsToStreamFilter(sc, modbus_policy, policy_id);
 #ifdef TARGET_BASED
-    _addServicesToStream5Filter(sc, policy_id);
+    _addServicesToStreamFilter(sc, policy_id);
 #endif
 
     /* Add preprocessor rule options here */
@@ -328,7 +357,6 @@ static void ProcessModbus(void *ipacketp, void *contextp)
     SFSnortPacket *packetp = (SFSnortPacket *)ipacketp;
     modbus_session_data_t *sessp;
     PROFILE_VARS;
-
     // preconditions - what we registered for
     assert(IsTCP(packetp) && packetp->payload && packetp->payload_size);
 
@@ -338,7 +366,7 @@ static void ProcessModbus(void *ipacketp, void *contextp)
     modbus_eval_config = sfPolicyUserDataGetCurrent(modbus_context_id);
 
     /* Look for a previously-allocated session data. */
-    sessp = _dpd.streamAPI->get_application_data(packetp->stream_session_ptr, PP_MODBUS);
+    sessp = _dpd.sessionAPI->get_application_data(packetp->stream_session, PP_MODBUS);
 
     if (sessp == NULL)
     {
@@ -350,8 +378,13 @@ static void ProcessModbus(void *ipacketp, void *contextp)
         }
     }
 
-    if ( !PacketHasFullPDU(packetp) )
+    if ( !PacketHasFullPDU(packetp) && ModbusIsPafActive(packetp) )
     {
+        if ( sessp )
+        {
+            sessp->unit = 0;
+            sessp->func = 0;
+        }
         /* If a packet is rebuilt, but not a full PDU, then it's garbage that
            got flushed at the end of a stream. */
         if ( packetp->flags & (FLAG_REBUILT_STREAM|FLAG_PDU_HEAD) )
@@ -366,7 +399,7 @@ static void ProcessModbus(void *ipacketp, void *contextp)
 
     if (sessp == NULL)
     {
-        /* Create session data and attach it to the Stream5 session */
+        /* Create session data and attach it to the Stream session */
         sessp = ModbusCreateSessionData(packetp);
 
         if ( !sessp )
@@ -382,7 +415,11 @@ static void ProcessModbus(void *ipacketp, void *contextp)
     packetp->flags |= FLAG_ALLOW_MULTIPLE_DETECT;
 
     /* Do preprocessor-specific detection stuff here */
-    ModbusDecode(modbus_eval_config, packetp);
+    if (ModbusDecode(modbus_eval_config, packetp) == MODBUS_FAIL)
+    {
+        sessp->unit = 0;
+        sessp->func = 0;
+    }
 
     /* That's the end! */
     PREPROC_PROFILE_END(modbusPerfStats);
@@ -392,7 +429,7 @@ static void ProcessModbus(void *ipacketp, void *contextp)
 static int ModbusPortCheck(modbus_config_t *config, SFSnortPacket *packet)
 {
 #ifdef TARGET_BASED
-    int16_t app_id = _dpd.streamAPI->get_application_protocol_id(packet->stream_session_ptr);
+    int16_t app_id = _dpd.sessionAPI->get_application_protocol_id(packet->stream_session);
 
     /* call to get_application_protocol_id gave an error */
     if (app_id == SFTARGET_UNKNOWN_PROTOCOL)
@@ -423,7 +460,7 @@ static modbus_session_data_t * ModbusCreateSessionData(SFSnortPacket *packet)
     modbus_session_data_t *data = NULL;
 
     /* Sanity Check */
-    if (!packet || !packet->stream_session_ptr)
+    if (!packet || !packet->stream_session)
         return NULL;
 
     data = (modbus_session_data_t *)calloc(1, sizeof(modbus_session_data_t));
@@ -431,12 +468,12 @@ static modbus_session_data_t * ModbusCreateSessionData(SFSnortPacket *packet)
     if (!data)
         return NULL;
 
-    /* Attach to Stream5 session */
-    _dpd.streamAPI->set_application_data(packet->stream_session_ptr, PP_MODBUS,
+    /* Attach to Stream session */
+    _dpd.sessionAPI->set_application_data(packet->stream_session, PP_MODBUS,
         data, FreeModbusData);
 
     /* Not sure when this reference counting stuff got added to the old preprocs */
-    data->policy_id = _dpd.getRuntimePolicy();
+    data->policy_id = _dpd.getNapRuntimePolicy();
     data->context_id = modbus_context_id;
     ((modbus_config_t *)sfPolicyUserDataGetCurrent(modbus_context_id))->ref_count++;
 
@@ -481,7 +518,7 @@ static void ModbusReload(struct _SnortConfig *sc, char *args, void **new_config)
 
 static int ModbusReloadVerify(struct _SnortConfig *sc, void *swap_config)
 {
-    if (!_dpd.isPreprocEnabled(sc, PP_STREAM5))
+    if (!_dpd.isPreprocEnabled(sc, PP_STREAM))
     {
         _dpd.errMsg("SetupModbus(): The Stream preprocessor must be enabled.\n");
         return -1;
@@ -538,8 +575,30 @@ static void ModbusReloadSwapFree(void *data)
 }
 #endif
 
-/* Stream5 filter functions */
-static void _addPortsToStream5Filter(struct _SnortConfig *sc, modbus_config_t *config, tSfPolicyId policy_id)
+static void registerPortsForDispatch( struct _SnortConfig *sc, modbus_config_t *policy )
+{
+    uint32_t port;
+
+    for ( port = 0; port < MAX_PORTS; port++ )
+    {
+        if( isPortEnabled( policy->ports, port ) )
+            _dpd.sessionAPI->enable_preproc_for_port( sc, PP_MODBUS, PROTO_BIT__TCP, port ); 
+    }
+}
+
+static void registerPortsForReassembly( modbus_config_t *policy, int direction )
+{
+    uint32_t port;
+
+    for ( port = 0; port < MAX_PORTS; port++ )
+    {
+        if( isPortEnabled( policy->ports, port ) )
+            _dpd.streamAPI->register_reassembly_port( NULL, port, direction );
+    }
+}
+
+/* Stream filter functions */
+static void _addPortsToStreamFilter(struct _SnortConfig *sc, modbus_config_t *config, tSfPolicyId policy_id)
 {
     if (config == NULL)
         return;
@@ -553,8 +612,8 @@ static void _addPortsToStream5Filter(struct _SnortConfig *sc, modbus_config_t *c
             if(config->ports[(portNum/8)] & (1<<(portNum%8)))
             {
                 //Add port the port
-                _dpd.streamAPI->set_port_filter_status(
-                    sc, IPPROTO_TCP, (uint16_t)portNum, PORT_MONITOR_SESSION, policy_id, 1);
+                _dpd.streamAPI->set_port_filter_status( sc, IPPROTO_TCP, (uint16_t)portNum,
+                                                        PORT_MONITOR_SESSION, policy_id, 1 );
             }
         }
     }
@@ -562,7 +621,7 @@ static void _addPortsToStream5Filter(struct _SnortConfig *sc, modbus_config_t *c
 }
 
 #ifdef TARGET_BASED
-static void _addServicesToStream5Filter(struct _SnortConfig *sc, tSfPolicyId policy_id)
+static void _addServicesToStreamFilter(struct _SnortConfig *sc, tSfPolicyId policy_id)
 {
     _dpd.streamAPI->set_service_filter_status(sc, modbus_app_id, PORT_MONITOR_SESSION, policy_id, 1);
 }
@@ -601,7 +660,7 @@ static int ModbusCheckPolicyConfig(
 {
     _dpd.setParserPolicy(sc, policy_id);
 
-    if (!_dpd.isPreprocEnabled(sc, PP_STREAM5))
+    if (!_dpd.isPreprocEnabled(sc, PP_STREAM))
     {
         _dpd.errMsg("%s(%d) ModbusCheckPolicyConfig(): The Stream preprocessor "
                       "must be enabled.\n", *_dpd.config_file, *_dpd.config_line);

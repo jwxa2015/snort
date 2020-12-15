@@ -3,7 +3,7 @@
  **
  **  sfcontrol.c
  **
- **  Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+ **  Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
  **  Copyright (C) 2002-2013 Sourcefire, Inc.
  **  Author(s):  Ron Dempster <rdempster@sourcefire.com>
  **
@@ -70,6 +70,8 @@ struct _CS_MESSAGE
 
 typedef struct _CS_MESSAGE CSMessage;
 
+
+/* ANY CHANGES MADE HERE SHOULD BE DUPLICATED TO src/sfutil/sfdebug.h */
 static void DumpHex(FILE *fp, const uint8_t *data, unsigned len)
 {
     char str[18];
@@ -100,11 +102,11 @@ static void DumpHex(FILE *fp, const uint8_t *data, unsigned len)
     }
     if (pos)
     {
-        str[pos] = 0;
         for (; pos < 17; pos++)
         {
             if (pos == 8)
             {
+                str[pos] = ' ';
                 pos++;
                 fprintf(fp, "%s", "    ");
             }
@@ -112,7 +114,9 @@ static void DumpHex(FILE *fp, const uint8_t *data, unsigned len)
             {
                 fprintf(fp, "%s", "   ");
             }
+            str[pos] = 0;
         }
+        str[pos] = 0;
         fprintf(fp, "  %s\n", str);
     }
 }
@@ -131,7 +135,7 @@ static int SendMessage(int socket_fd, const CSMessage *msg, uint32_t len)
 
     do
     {
-        numsent = write(socket_fd, (*(uint8_t **)&msg) + total, total_len - total);
+        numsent = write(socket_fd, ((const unsigned char *)msg) + total, total_len - total);
         if (!numsent)
             return 0;
         else if (numsent > 0)
@@ -169,7 +173,7 @@ static int ReadResponse(int socket_fd, CSMessageHeader *hdr)
 
     do
     {
-        numread = read(socket_fd, (*(uint8_t **)&hdr) + total, sizeof(*hdr) - total);
+        numread = read(socket_fd, ((unsigned char *)hdr) + total, sizeof(*hdr) - total);
         if (!numread)
             return 0;
         else if (numread > 0)
@@ -230,7 +234,7 @@ int main(int argc, char *argv[])
     const char *sep;
     ssize_t len;
     PrintMode mode = PRINT_MODE_DETAIL;
-    const char *extra;
+    const char *extra = NULL;
     unsigned int extra_len = 0;
 
     if (argc < 3 || argc > 5 || !*argv[1] || !*argv[2])

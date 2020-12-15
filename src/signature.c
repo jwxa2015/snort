@@ -1,5 +1,5 @@
 /*
-** Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+** Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
 ** Copyright (C) 2002-2013 Sourcefire, Inc.
 ** Author(s):   Andrew R. Baker <andrewb@sourcefire.com>
 **
@@ -359,7 +359,7 @@ void OtnFree(void *data)
     if (otn->sigInfo.message != NULL)
     {
         if (!otn->generated)
-            free(otn->sigInfo.message);
+            free((void*)otn->sigInfo.message);
     }
 #ifdef TARGET_BASED
     for (svc_idx = 0; svc_idx < otn->sigInfo.num_services; svc_idx++)
@@ -392,7 +392,7 @@ void OtnFree(void *data)
 
         for (i = 0; i < otn->proto_node_num; i++)
         {
-            RuleTreeNode *rtn = deleteRtnFromOtn(otn, i);
+            RuleTreeNode *rtn = deleteRtnFromOtn(NULL, otn, i);
             if (rtn != NULL)
                 free(rtn);
         }

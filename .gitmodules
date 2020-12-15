@@ -1,0 +1,3 @@
+[submodule "libhpfeeds"]
+	path = libhpfeeds
+	url = ../../hpfeeds/libhpfeeds.git

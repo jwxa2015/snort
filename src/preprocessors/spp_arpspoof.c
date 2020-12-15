@@ -1,6 +1,6 @@
 /* $Id$ */
 /*
-** Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+** Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
 ** Copyright (C) 2004-2013 Sourcefire, Inc.
 ** Copyright (C) 2001-2004 Jeff Nathan <jeff@snort.org>
 **
@@ -101,7 +101,7 @@
 #include "snort.h"
 #include "profiler.h"
 #include "sfPolicy.h"
-
+#include "session_api.h"
 
 /*  D E F I N E S  **************************************************/
 #define MODNAME "spp_arpspoof"
@@ -205,7 +205,7 @@ static void ARPspoofInit(struct _SnortConfig *sc, char *args)
        arp_spoof_config = sfPolicyConfigCreate();
 
 #ifdef PERF_PROFILING
-        RegisterPreprocessorProfile("arpspoof", &arpPerfStats, 0, &totalPerfStats);
+        RegisterPreprocessorProfile("arpspoof", &arpPerfStats, 0, &totalPerfStats, NULL);
 #endif
 
         AddFuncToPreprocCleanExitList(ARPspoofCleanExit, NULL, PRIORITY_LAST, PP_ARPSPOOF);
@@ -235,6 +235,7 @@ static void ARPspoofInit(struct _SnortConfig *sc, char *args)
     sfPolicyUserDataSetCurrent(arp_spoof_config, pCurrentPolicyConfig);
     /* Add arpspoof to the preprocessor function list */
     AddFuncToPreprocList(sc, DetectARPattacks, PRIORITY_NETWORK, PP_ARPSPOOF, PROTO_BIT__ARP);
+    session_api->enable_preproc_all_ports( sc, PP_ARPSPOOF, PROTO_BIT__ARP );
 
     //policy independent configuration. First policy defines actual values.
     if (policy_id != 0)
@@ -375,16 +376,52 @@ static void DetectARPattacks(Packet *p, void *context)
 {
     IPMacEntry *ipme;
     ArpSpoofConfig *aconfig = NULL;
+    const uint8_t *dst_mac_addr = NULL, *src_mac_addr = NULL;
     PROFILE_VARS;
-    sfPolicyUserPolicySet (arp_spoof_config, getRuntimePolicy());
+    sfPolicyUserPolicySet (arp_spoof_config, getNapRuntimePolicy());
     aconfig = (ArpSpoofConfig *)sfPolicyUserDataGetCurrent(arp_spoof_config);
+    uint32_t *arp_spa;
 
     /* is the packet valid? */
-    if ( aconfig == NULL )
+    if ( aconfig == NULL || p->ah == NULL)
         return;
 
     // preconditions - what we registered for
-    assert(p->eh && p->ah);
+    if( p->eh != NULL)
+    {
+        src_mac_addr = p->eh->ether_src;
+        dst_mac_addr = p->eh->ether_dst;
+    }
+#ifndef NO_NON_ETHER_DECODER
+    else if( p->wifih != NULL )
+    {
+         if ((p->wifih->frame_control & WLAN_FLAG_TODS) &&
+             (p->wifih->frame_control & WLAN_FLAG_FROMDS))
+         {
+             dst_mac_addr = p->wifih->addr3;
+             src_mac_addr = p->wifih->addr4;
+         }
+         else if (p->wifih->frame_control & WLAN_FLAG_TODS)
+         {
+             src_mac_addr = p->wifih->addr2;
+             dst_mac_addr = p->wifih->addr3;
+         }
+         else if (p->wifih->frame_control & WLAN_FLAG_FROMDS)
+         {
+             dst_mac_addr = p->wifih->addr1;
+             src_mac_addr = p->wifih->addr3;
+         }
+         else
+         {
+             dst_mac_addr = p->wifih->addr1;
+             src_mac_addr = p->wifih->addr2;
+         }
+    }
+#endif
+    else
+    {
+         return;
+    }
 
     /* is the ARP protocol type IP and the ARP hardware type Ethernet? */
     if ((ntohs(p->ah->ea_hdr.ar_hrd) != 0x0001) ||
@@ -398,7 +435,7 @@ static void DetectARPattacks(Packet *p, void *context)
         case ARPOP_REQUEST:
             if (aconfig->check_unicast_arp)
             {
-                if (memcmp((u_char *)p->eh->ether_dst, (u_char *)bcast, 6) != 0)
+                if (memcmp((u_char *)dst_mac_addr, (u_char *)bcast, 6) != 0)
                 {
                     SnortEventqAdd(GENERATOR_SPP_ARPSPOOF,
                             ARPSPOOF_UNICAST_ARP_REQUEST, 1, 0, 3,
@@ -408,7 +445,7 @@ static void DetectARPattacks(Packet *p, void *context)
                             "MODNAME: Unicast request\n"););
                 }
             }
-            else if (memcmp((u_char *)p->eh->ether_src,
+            else if (memcmp((u_char *)src_mac_addr,
                     (u_char *)p->ah->arp_sha, 6) != 0)
             {
                 SnortEventqAdd(GENERATOR_SPP_ARPSPOOF,
@@ -420,7 +457,7 @@ static void DetectARPattacks(Packet *p, void *context)
             }
             break;
         case ARPOP_REPLY:
-            if (memcmp((u_char *)p->eh->ether_src,
+            if (memcmp((u_char *)src_mac_addr,
                     (u_char *)p->ah->arp_sha, 6) != 0)
             {
                 SnortEventqAdd(GENERATOR_SPP_ARPSPOOF,
@@ -430,7 +467,7 @@ static void DetectARPattacks(Packet *p, void *context)
                 DEBUG_WRAP(DebugMessage(DEBUG_PLUGIN,
                         "MODNAME: Ethernet/ARP mismatch reply src\n"););
             }
-            else if (memcmp((u_char *)p->eh->ether_dst,
+            else if (memcmp((u_char *)dst_mac_addr,
                     (u_char *)p->ah->arp_tha, 6) != 0)
             {
                 SnortEventqAdd(GENERATOR_SPP_ARPSPOOF,
@@ -449,8 +486,9 @@ static void DetectARPattacks(Packet *p, void *context)
         return;
 
     /* LookupIPMacEntryByIP() is too slow, will be fixed later */
+    arp_spa = (uint32_t *)&p->ah->arp_spa[0];
     if ((ipme = LookupIPMacEntryByIP(aconfig->ipmel,
-                                     *(uint32_t *)&p->ah->arp_spa)) == NULL)
+                                     *arp_spa)) == NULL)
     {
         DEBUG_WRAP(DebugMessage(DEBUG_PLUGIN,
                 "MODNAME: LookupIPMacEntryByIp returned NULL\n"););
@@ -464,7 +502,7 @@ static void DetectARPattacks(Packet *p, void *context)
         /* If the Ethernet source address or the ARP source hardware address
          * in p doesn't match the MAC address in ipme, then generate an alert
          */
-        if ((memcmp((uint8_t *)p->eh->ether_src,
+        if ((memcmp((uint8_t *)src_mac_addr,
                 (uint8_t *)ipme->mac_addr, 6)) ||
                 (memcmp((uint8_t *)p->ah->arp_sha,
                 (uint8_t *)ipme->mac_addr, 6)))
@@ -531,7 +569,7 @@ static IPMacEntry *LookupIPMacEntryByIP(IPMacEntryList *ip_mac_entry_list,
     IPMacEntryListNode *current;
 #if defined(DEBUG)
     char *cha, *chb;
-    snort_ip ina, inb;
+    sfaddr_t ina, inb;
 #endif
 
     if (ip_mac_entry_list == NULL)
@@ -548,6 +586,8 @@ static IPMacEntry *LookupIPMacEntryByIP(IPMacEntryList *ip_mac_entry_list,
 
         DEBUG_WRAP(DebugMessage(DEBUG_PLUGIN,
             "MODNAME: LookupIPMacEntryByIP() comparing %s to %s\n", cha, chb););
+        free(cha);
+        free(chb);
 #endif
         if (current->ip_mac_entry->ipv4_addr == ipv4_addr)
         {
@@ -636,7 +676,7 @@ static void PrintIPMacEntryList(IPMacEntryList *ip_mac_entry_list)
 {
     IPMacEntryListNode *current;
     int i;
-    snort_ip in;
+    sfaddr_t in;
 
     if (ip_mac_entry_list == NULL)
         return;

@@ -1,6 +1,6 @@
 /* $Id$ */
 /*
- ** Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+ ** Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
  ** Copyright (C) 2004-2013 Sourcefire, Inc.
  **
  ** This program is free software; you can redistribute it and/or modify
@@ -36,6 +36,8 @@
 
 /* your preprocessor header file goes here */
 
+#define _GNU_SOURCE
+
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
@@ -57,12 +59,14 @@
 #include <windows.h>
 #endif
 
+#include <errno.h>
 #include "ftpp_eo_log.h"
 #include "pp_ftp.h"
 #include "pp_telnet.h"
 #include "ftpp_return_codes.h"
 #include "ftp_cmd_lookup.h"
 #include "ftp_bounce_lookup.h"
+#include "spp_ftptelnet.h"
 //#include "decode.h"
 #include "snort_debug.h"
 #include "stream_api.h"
@@ -76,89 +80,13 @@
 
 #ifdef TARGET_BASED
 extern int16_t ftp_data_app_id;
+extern unsigned s_ftpdata_eof_cb_id;
 #endif
-/*
- * Used to keep track of pipelined commands and the last one
- * that resulted in a
- */
-static int ftp_cmd_pipe_index = 0;
-
-#if 0
-/*
- * Function: getIP(char **ip_start,
- *                 char *last_char,
- *                 char term_char,
- *                 uint32_t *ipRet,
- *                 uint16_t *portRet)
- *
- * Purpose: Returns a 32bit IP address and port from an FTP-style
- *          string -- ie, a,b,c,d,p1,p2.  Stops checking when term_char
- *          is seen.  Used to get address and port information from FTP
- *          PORT command and server response to PASV command.
- *
- * Arguments ip_start        => Pointer to pointer to the start of string.
- *                              Updated to end of IP address if successful.
- *           last_char       => End of string
- *           term_char       => Character delimiting the end of the address.
- *           ipRet           => Return pointer to 32bit address on success
- *           portRet         => Return pointer to 16bit port on success
- *
- * Returns: int => return code indicating error or success
- *
- */
-int getIP(const int type, const char **ip_start, const char *last_char, char *term_char,
-          snort_ip *ipRet, uint16_t *portRet)
-{
-    uint32_t ip=0;
-    uint16_t port=0;
-    int octet=0;
-    const char *this_param = *ip_start;
-
-    do
-    {
-        int value = 0;
-        do
-        {
-            if (!isdigit((int)(*this_param)))
-            {
-                return FTPP_NON_DIGIT;
-            }
-            value = value * 10 + (*this_param - '0');
-            this_param++;
-        } while ((this_param < last_char) &&
-                 (*this_param != ',') &&
-                 (*this_param != term_char));
-        if (value > 0xFF)
-        {
-            return FTPP_INVALID_ARG;
-        }
-        if (octet  < 4)
-        {
-            ip = (ip << 8) + value;
-        }
-        else
-        {
-            port = (port << 8) + value;
-        }
-
-        if (*this_param != term_char)
-            this_param++;
-        octet++;
-    } while ((this_param < last_char) && (*this_param != term_char) );
-
-    if (octet != 6)
-    {
-        return FTPP_MALFORMED_IP_PORT;
-    }
-
-// XXX-IPv6 NOT YET IMPLEMENTED - IPv4 only at the moment
-    sfip_set_raw(ipRet, &ip, AF_INET);
-    *portRet = port;
-    *ip_start = this_param;
-
-    return FTPP_SUCCESS;
-}
+#ifdef DUMP_BUFFER
+#include "ftptelnet_buffer_dump.h"
 #endif
+
+#define DEFAULT_MEM_ALLOC 512
 
 /*
  * Function: getIP959(char **ip_start,
@@ -183,7 +111,7 @@ int getIP(const int type, const char **ip_start, const char *last_char, char *te
  */
 static int getIP959(
     const char **ip_start, const char *last_char, char *term_char,
-    snort_ip *ipRet, uint16_t *portRet
+    sfaddr_t *ipRet, uint16_t *portRet
 )
 {
     uint32_t ip=0;
@@ -255,7 +183,7 @@ static int getIP959(
  */
 static int getIP1639 (
     const char **ip_start, const char *last_char, char *term_char,
-    snort_ip* ipRet, uint16_t *portRet
+    sfaddr_t* ipRet, uint16_t *portRet
 )
 {
     char bytes[21];  /* max of 1+5+3 and 1+17+3 */
@@ -367,7 +295,7 @@ void CopyField (
 
 static int getIP2428 (
     const char **ip_start, const char *last_char, char *term_char,
-    snort_ip* ipRet, uint16_t *portRet, FTP_PARAM_TYPE ftyp
+    sfaddr_t* ipRet, uint16_t *portRet, FTP_PARAM_TYPE ftyp
 )
 {
     const char* tok = *ip_start;
@@ -400,7 +328,7 @@ static int getIP2428 (
 
             case 2:  /* check address */
                 CopyField(buf, tok, sizeof(buf), last_char, delim);
-                if ( sfip_pton(buf, ipRet) != SFIP_SUCCESS || family != ipRet->family )
+                if ( sfaddr_pton(buf, ipRet) != SFIP_SUCCESS || ipRet->family != family )
                     return FTPP_INVALID_ARG;
 
                 fieldMask |= 2;
@@ -441,7 +369,7 @@ static int getIP2428 (
 
 static int getFTPip(
     FTP_PARAM_TYPE ftyp, const char **ip_start, const char *last_char,
-    char *term_char, snort_ip *ipRet, uint16_t *portRet
+    char *term_char, sfaddr_t *ipRet, uint16_t *portRet
 )
 {
     if ( ftyp == e_host_port )
@@ -779,7 +707,7 @@ static int validate_param(SFSnortPacket *p,
     case e_long_host_port:  /* LPRT: af,hal,h1,h2,h3,h4...,pal,p1,p2... */
     case e_extd_host_port:  /* EPRT: |<af>|<addr>|<port>| */
         {
-            snort_ip ipAddr;
+            sfaddr_t ipAddr;
             uint16_t port=0;
 
             int ret = getFTPip(
@@ -801,7 +729,7 @@ static int validate_param(SFSnortPacket *p,
                 break;
             }
 
-            if ( ThisFmt->type == e_extd_host_port && !IP_IS_SET(ipAddr) )
+            if ( ThisFmt->type == e_extd_host_port && !sfaddr_is_set(&ipAddr) )
             {
                 // actually, we expect no addr in 229 responses, which is
                 // understood to be server address, so we set that here
@@ -815,7 +743,7 @@ static int validate_param(SFSnortPacket *p,
                     int alert = 1;
 
                     FTP_BOUNCE_TO *BounceTo = ftp_bounce_lookup_find(
-                        Session->client_conf->bounce_lookup, (snort_ip_p)IP_ARG(ipAddr), &iRet);
+                        Session->client_conf->bounce_lookup, &ipAddr, &iRet);
                     if (BounceTo)
                     {
                         if (BounceTo->portlo)
@@ -1051,11 +979,27 @@ int initialize_ftp(FTP_SESSION *Session, SFSnortPacket *p, int iMode)
     }
 
     if (iMode == FTPP_SI_CLIENT_MODE)
+    {
         req = &Session->client.request;
+
+#ifdef DUMP_BUFFER
+        dumpBuffer(FTP_REQUEST_CMD_LINE,req->cmd_line,req->cmd_line_size);
+        dumpBuffer(FTP_REQUEST_CMD,req->cmd_begin,req->cmd_size);
+        dumpBuffer(FTP_REQUEST_PARAM,req->param_begin,req->param_size);
+#endif
+
+    }
     else if (iMode == FTPP_SI_SERVER_MODE)
     {
         FTP_SERVER_RSP *rsp = &Session->server.response;
         req = (FTP_CLIENT_REQ *)rsp;
+
+#ifdef DUMP_BUFFER
+        dumpBuffer(FTP_RESPONSE_LINE,rsp->rsp_line,rsp->rsp_line_size);
+        dumpBuffer(FTP_RESPONSE_DUMP,rsp->rsp_begin,rsp->rsp_size);
+        dumpBuffer(FTP_RESPONSE_MSG,rsp->msg_begin,rsp->msg_size);
+#endif
+
     }
     else
         return FTPP_INVALID_ARG;
@@ -1065,6 +1009,18 @@ int initialize_ftp(FTP_SESSION *Session, SFSnortPacket *p, int iMode)
     req->pipeline_req = (const char *)read_ptr;
 
     return FTPP_SUCCESS;
+}
+
+static inline void prepareForEncryption(FTP_SESSION *Session, FTPTELNET_GLOBAL_CONF *global_conf, int new_encr_state)
+{
+    Session->encr_state = new_encr_state;
+    Session->encr_state_chello = true;
+    if (global_conf->encrypted.alert)
+    {
+        /* Alert on encrypted channel */
+        ftp_eo_event_log(Session, FTP_EO_ENCRYPTED,
+            NULL, NULL);
+    }
 }
 
 /*
@@ -1100,21 +1056,21 @@ static int do_stateful_checks(FTP_SESSION *Session, SFSnortPacket *p,
         }
         else if (Session->data_chan_state & DATA_CHAN_PASV_CMD_ISSUED)
         {
-            if (ftp_cmd_pipe_index == Session->data_chan_index)
+            if (Session->ftp_cmd_pipe_index == Session->data_chan_index)
             {
-                if (Session->data_xfer_index == -1)
-                    ftp_cmd_pipe_index = 0;
-                Session->data_chan_index = -1;
+                if (Session->data_xfer_index == 0)
+                    Session->ftp_cmd_pipe_index = 1;
+                Session->data_chan_index = 0;
 
                 if ( rsp_code >= 227 && rsp_code <= 229 )
                 {
-                    snort_ip ipAddr;
+                    sfaddr_t ipAddr;
                     uint16_t port=0;
                     const char *ip_begin = req->param_begin;
                     IP_CLEAR(ipAddr);
                     Session->data_chan_state &= ~DATA_CHAN_PASV_CMD_ISSUED;
                     Session->data_chan_state |= DATA_CHAN_PASV_CMD_ACCEPT;
-                    Session->data_chan_index = -1;
+                    Session->data_chan_index = 0;
                     /* Interpret response message to identify the
                      * Server IP/Port.  Server response is inside
                      * a pair of ()s.  Find the left (, and use same
@@ -1147,7 +1103,7 @@ static int do_stateful_checks(FTP_SESSION *Session, SFSnortPacket *p,
                         );
                         if (iRet == FTPP_SUCCESS)
                         {
-                            if (!IP_IS_SET(ipAddr))
+                            if (!sfaddr_is_set(&ipAddr))
                                 IP_COPY_VALUE(Session->serverIP, GET_SRC_IP(p));
                             else
                             {
@@ -1157,25 +1113,33 @@ static int do_stateful_checks(FTP_SESSION *Session, SFSnortPacket *p,
                             IP_COPY_VALUE(Session->clientIP, GET_DST_IP(p));
                             Session->clientPort = 0;
 #ifdef TARGET_BASED
-                            if ((_dpd.fileAPI->get_max_file_depth() > 0) || !(Session->server_conf->data_chan))
+                            if ((_dpd.fileAPI->get_max_file_depth(_dpd.getCurrentSnortConfig(), false) > 0) || !(Session->server_conf->data_chan))
                             {
                                 FTP_DATA_SESSION *ftpdata = FTPDataSessionNew(p);
 
                                 if (ftpdata)
                                 {
                                     int result;
-                                    /* This is a passive data transfer */ 
+                                    /* This is a passive data transfer */
                                     ftpdata->mode = FTPP_XFER_PASSIVE;
-
                                     ftpdata->data_chan = Session->server_conf->data_chan;
+                                    /* Store the FTP_SESSION in FTP_DATA_SESSION, needed when FTP_DATA_SESSION is freed.
+                                     * This is needed to handle pruning of FTP_DATA_SESSION */
+                                    ftpdata->ftpssn = Session;
+                                    /*If a FTP_DATA_SESSION already exists, the FTP_SESSION reference in that should be removed*/
+                                    if(Session->datassn)
+                                    {
+                                        FTP_DATA_SESSION * ssn = Session->datassn;
+                                        ssn->ftpssn = NULL;
+                                    }
+                                    Session->datassn = ftpdata;
 
                                     /* Call into Streams to mark data channel as ftp-data */
-                                    result = _dpd.streamAPI->set_application_protocol_id_expected(
-                                        IP_ARG(Session->clientIP), Session->clientPort,
-                                        IP_ARG(Session->serverIP), Session->serverPort,
-                                        (uint8_t)(GET_IPH_PROTO(p)),
-                                        p->pkt_header->ts.tv_sec, ftp_data_app_id,
-                                        PP_FTPTELNET, (void *)ftpdata, &FTPDataSessionFree);
+                                    result = _dpd.streamAPI->set_application_protocol_id_expected_preassign_callback(
+                                        p, IP_ARG(Session->clientIP), Session->clientPort,
+                                        IP_ARG(Session->serverIP), Session->serverPort, GET_IPH_PROTO(p),
+                                        ftp_data_app_id, PP_FTPTELNET, (void *)ftpdata, &FTPDataSessionFree,
+                                        s_ftpdata_eof_cb_id, SE_EOF, &p->expectedSession);
 
                                     if (result < 0)
                                         FTPDataSessionFree(ftpdata);
@@ -1188,11 +1152,9 @@ static int do_stateful_checks(FTP_SESSION *Session, SFSnortPacket *p,
                             {
                                 /* Call into Streams to mark data channel as something
                                  * to ignore. */
-                                _dpd.streamAPI->ignore_session(IP_ARG(Session->clientIP),
-                                        Session->clientPort, IP_ARG(Session->serverIP),
-                                        Session->serverPort, (uint8_t)(GET_IPH_PROTO(p)), p->pkt_header->ts.tv_sec,
-                                        PP_FTPTELNET, SSN_DIR_BOTH,
-                                        0 /* Not permanent */ );
+                                _dpd.sessionAPI->ignore_session(p, IP_ARG(Session->clientIP), Session->clientPort,
+                                        IP_ARG(Session->serverIP), Session->serverPort, GET_IPH_PROTO(p),
+                                        PP_FTPTELNET, SSN_DIR_BOTH, 0 /* Not permanent */, &p->expectedSession );
                             }
                         }
                     }
@@ -1203,24 +1165,24 @@ static int do_stateful_checks(FTP_SESSION *Session, SFSnortPacket *p,
                 }
                 else
                 {
-                    Session->data_chan_index = -1;
+                    Session->data_chan_index = 0;
                     Session->data_chan_state &= ~DATA_CHAN_PASV_CMD_ISSUED;
                 }
             }
         }
         else if (Session->data_chan_state & DATA_CHAN_PORT_CMD_ISSUED)
         {
-            if (ftp_cmd_pipe_index == Session->data_chan_index)
+            if (Session->ftp_cmd_pipe_index == Session->data_chan_index)
             {
-                if (Session->data_xfer_index == -1)
-                    ftp_cmd_pipe_index = 0;
-                Session->data_chan_index = -1;
+                if (Session->data_xfer_index == 0)
+                    Session->ftp_cmd_pipe_index = 1;
+                Session->data_chan_index = 0;
                 if (rsp_code == 200)
                 {
                     Session->data_chan_state &= ~DATA_CHAN_PORT_CMD_ISSUED;
                     Session->data_chan_state |= DATA_CHAN_PORT_CMD_ACCEPT;
-                    Session->data_chan_index = -1;
-                    if (IP_IS_SET(Session->clientIP))
+                    Session->data_chan_index = 0;
+                    if (sfaddr_is_set(&Session->clientIP))
                     {
                         /* This means we're not in passive mode. */
                         /* Server is listening/sending from its own IP,
@@ -1237,24 +1199,33 @@ static int do_stateful_checks(FTP_SESSION *Session, SFSnortPacket *p,
                         Session->serverPort = ntohs(p->tcph->th_sport) -1;
                         */
 #ifdef TARGET_BASED
-                        if ((_dpd.fileAPI->get_max_file_depth() > 0) || !(Session->server_conf->data_chan))
+                        if ((_dpd.fileAPI->get_max_file_depth(_dpd.getCurrentSnortConfig(), false) > 0) || !(Session->server_conf->data_chan))
                         {
                             FTP_DATA_SESSION *ftpdata = FTPDataSessionNew(p);
 
                             if (ftpdata)
                             {
                                 int result;
-                                /* This is a active data transfer */ 
+                                /* This is a active data transfer */
                                 ftpdata->mode = FTPP_XFER_ACTIVE;
                                 ftpdata->data_chan = Session->server_conf->data_chan;
+                                /* Store the FTP_SESSION in FTP_DATA_SESSION, needed when FTP_DATA_SESSION is freed.
+                                 * This is needed to handle pruning of FTP_DATA_SESSION */
+                                ftpdata->ftpssn = Session;
+                                /*If a FTP_DATA_SESSION already exists, the FTP_SESSION reference in that should be removed*/
+                                if(Session->datassn)
+                                {
+                                    FTP_DATA_SESSION * ssn = Session->datassn;
+                                    ssn->ftpssn = NULL;
+                                }
+                                Session->datassn = ftpdata;
 
                                 /* Call into Streams to mark data channel as ftp-data */
-                                result = _dpd.streamAPI->set_application_protocol_id_expected(
-                                    IP_ARG(Session->clientIP), Session->clientPort,
-                                    IP_ARG(Session->serverIP), Session->serverPort,
-                                    (uint8_t)(GET_IPH_PROTO(p)),
-                                    p->pkt_header->ts.tv_sec, ftp_data_app_id,
-                                    PP_FTPTELNET, (void *)ftpdata, &FTPDataSessionFree);
+                                result = _dpd.streamAPI->set_application_protocol_id_expected_preassign_callback(
+                                    p, IP_ARG(Session->serverIP), Session->serverPort,
+                                    IP_ARG(Session->clientIP), Session->clientPort, GET_IPH_PROTO(p),
+                                    ftp_data_app_id, PP_FTPTELNET, (void *)ftpdata, &FTPDataSessionFree,
+                                    s_ftpdata_eof_cb_id, SE_EOF, &p->expectedSession);
 
                                 if (result < 0)
                                     FTPDataSessionFree(ftpdata);
@@ -1267,31 +1238,49 @@ static int do_stateful_checks(FTP_SESSION *Session, SFSnortPacket *p,
                         {
                             /* Call into Streams to mark data channel as something
                              * to ignore. */
-                            _dpd.streamAPI->ignore_session(IP_ARG(Session->clientIP),
-                                    Session->clientPort, IP_ARG(Session->serverIP),
-                                    Session->serverPort, (uint8_t)(GET_IPH_PROTO(p)), p->pkt_header->ts.tv_sec,
-                                    PP_FTPTELNET, SSN_DIR_BOTH,
-                                    0 /* Not permanent */ );
+                            _dpd.sessionAPI->ignore_session(p, IP_ARG(Session->serverIP), Session->serverPort,
+                                    IP_ARG(Session->clientIP), Session->clientPort, GET_IPH_PROTO(p),
+                                    PP_FTPTELNET, SSN_DIR_BOTH, 0 /* Not permanent */, &p->expectedSession );
                         }
                     }
                 }
-                else if (ftp_cmd_pipe_index == Session->data_chan_index)
+                else if (Session->ftp_cmd_pipe_index == Session->data_chan_index)
                 {
-                    Session->data_chan_index = -1;
+                    Session->data_chan_index = 0;
                     Session->data_chan_state &= ~DATA_CHAN_PORT_CMD_ISSUED;
                 }
             }
         }
+        else if (Session->data_chan_state & DATA_CHAN_REST_CMD_ISSUED)
+        {
+            if (Session->ftp_cmd_pipe_index == Session->data_xfer_index)
+            {
+                if (Session->data_chan_index == 0)
+                    Session->ftp_cmd_pipe_index = 1;
+                Session->data_xfer_index = 0;
+                if (rsp_code == 350)
+                {
+#ifdef TARGET_BASED
+                    FTP_DATA_SESSION *ftpdata = Session->datassn;
+                    if(ftpdata)
+                        ftpdata->flags |= FTPDATA_FLG_REST;
+#endif
+                }
+                else
+                    Session->rest_cmd_offset= 0;
+                Session->data_chan_index = 0;
+                Session->data_chan_state &= ~DATA_CHAN_REST_CMD_ISSUED;
+            }
+        }
         else if (Session->data_chan_state & DATA_CHAN_XFER_CMD_ISSUED)
         {
-            if (ftp_cmd_pipe_index == Session->data_xfer_index)
+            if (Session->ftp_cmd_pipe_index == Session->data_xfer_index)
             {
-                if (Session->data_chan_index == -1)
-                    ftp_cmd_pipe_index = 0;
-                Session->data_xfer_index = -1;
+                if (Session->data_chan_index == 0)
+                    Session->ftp_cmd_pipe_index = 1;
+                Session->data_xfer_index = 0;
                 if ((rsp_code == 150) || (rsp_code == 125))
                 {
-                    Session->data_chan_state &= ~DATA_CHAN_XFER_CMD_ISSUED;
                     Session->data_chan_state = DATA_CHAN_XFER_STARTED;
                 }
                 /* Clear the session info for next transfer -->
@@ -1299,62 +1288,39 @@ static int do_stateful_checks(FTP_SESSION *Session, SFSnortPacket *p,
                 IP_CLEAR(Session->serverIP);
                 IP_CLEAR(Session->clientIP);
                 Session->serverPort = Session->clientPort = 0;
-
                 Session->data_chan_state = NO_STATE;
             }
         }
     } /* if (Session->server_conf->data_chan) */
 
-    if (global_conf->encrypted.on)
+    if (global_conf->encrypted.on && rsp_code == 234)
     {
+        /* any of these states is now anticipatory of the client hello */
         switch(Session->encr_state)
         {
         case AUTH_TLS_CMD_ISSUED:
-            if (rsp_code == 234)
-            {
-                /* Could check that response msg includes "TLS" */
-                Session->encr_state = AUTH_TLS_ENCRYPTED;
-                if (global_conf->encrypted.alert)
-                {
-                    /* Alert on encrypted channel */
-                    ftp_eo_event_log(Session, FTP_EO_ENCRYPTED,
-                        NULL, NULL);
-                }
-                DEBUG_WRAP(DebugMessage(DEBUG_FTPTELNET,
-                    "FTP stream is now TLS encrypted\n"););
-            }
+            prepareForEncryption(Session, global_conf, AUTH_TLS_ENCRYPTED);
+            DEBUG_WRAP(DebugMessage(DEBUG_FTPTELNET,
+                "FTP stream is now TLS encrypted\n"););
             break;
         case AUTH_SSL_CMD_ISSUED:
-            if (rsp_code == 234)
-            {
-                /* Could check that response msg includes "SSL" */
-                Session->encr_state = AUTH_SSL_ENCRYPTED;
-                if (global_conf->encrypted.alert)
-                {
-                    /* Alert on encrypted channel */
-                    ftp_eo_event_log(Session, FTP_EO_ENCRYPTED,
-                        NULL, NULL);
-                }
-                DEBUG_WRAP(DebugMessage(DEBUG_FTPTELNET,
-                    "FTP stream is now SSL encrypted\n"););
-            }
+            prepareForEncryption(Session, global_conf, AUTH_SSL_ENCRYPTED);
+            DEBUG_WRAP(DebugMessage(DEBUG_FTPTELNET,
+                "FTP stream is now SSL encrypted\n"););
             break;
         case AUTH_UNKNOWN_CMD_ISSUED:
-            if (rsp_code == 234)
-            {
-                Session->encr_state = AUTH_UNKNOWN_ENCRYPTED;
-                if (global_conf->encrypted.alert)
-                {
-                    /* Alert on encrypted channel */
-                    ftp_eo_event_log(Session, FTP_EO_ENCRYPTED,
-                        NULL, NULL);
-                }
-                DEBUG_WRAP(DebugMessage(DEBUG_FTPTELNET,
-                    "FTP stream is now encrypted\n"););
-            }
+        default: // encr_state got confused, but we do have a 234
+            prepareForEncryption(Session, global_conf, AUTH_UNKNOWN_ENCRYPTED);
+            DEBUG_WRAP(DebugMessage(DEBUG_FTPTELNET,
+                "FTP stream is now encrypted\n"););
+            break;
+        case AUTH_TLS_ENCRYPTED:
+        case AUTH_SSL_ENCRYPTED:
+        case AUTH_UNKNOWN_ENCRYPTED:
+            // already been through here
             break;
         }
-    } /* if (global_conf->encrypted.on) */
+    } /* if (global_conf->encrypted.on && rsp_code == 234) */
 
     return iRet;
 }
@@ -1398,6 +1364,9 @@ int check_ftp(FTP_SESSION  *ftpssn, SFSnortPacket *p, int iMode)
     FTPTELNET_GLOBAL_CONF *global_conf = (FTPTELNET_GLOBAL_CONF *)sfPolicyUserDataGet(ftpssn->global_conf, ftpssn->policy_id);
     FTP_CLIENT_REQ *req;
     FTP_CMD_CONF *CmdConf = NULL;
+#ifdef TARGET_BASED
+    FTP_DATA_SESSION *datassn;
+#endif
 
     const unsigned char *read_ptr;
     const unsigned char *end = p->payload + p->payload_size;
@@ -1408,7 +1377,7 @@ int check_ftp(FTP_SESSION  *ftpssn, SFSnortPacket *p, int iMode)
     if (iMode == FTPP_SI_CLIENT_MODE)
     {
         req = &ftpssn->client.request;
-        ftp_cmd_pipe_index = 0;
+        ftpssn->ftp_cmd_pipe_index = 1;
     }
     else if (iMode == FTPP_SI_SERVER_MODE)
     {
@@ -1516,7 +1485,7 @@ int check_ftp(FTP_SESSION  *ftpssn, SFSnortPacket *p, int iMode)
                     if (!global_conf->check_encrypted_data)
                     {
                         /* Mark this session & packet as one to ignore */
-                        _dpd.streamAPI->stop_inspection(p->stream_session_ptr, p,
+                        _dpd.sessionAPI->stop_inspection(p->stream_session, p,
                                                 SSN_DIR_BOTH, -1, 0);
                     }
                     DEBUG_WRAP(DebugMessage(DEBUG_FTPTELNET,
@@ -1600,7 +1569,7 @@ int check_ftp(FTP_SESSION  *ftpssn, SFSnortPacket *p, int iMode)
                     if (!global_conf->check_encrypted_data)
                     {
                         /* Mark this session & packet as one to ignore */
-                        _dpd.streamAPI->stop_inspection(p->stream_session_ptr, p,
+                        _dpd.sessionAPI->stop_inspection(p->stream_session, p,
                                                 SSN_DIR_BOTH, -1, 0);
                     }
                     DEBUG_WRAP(DebugMessage(DEBUG_FTPTELNET,
@@ -1784,7 +1753,13 @@ int check_ftp(FTP_SESSION  *ftpssn, SFSnortPacket *p, int iMode)
                     NULL, NULL);
                 iRet = FTPP_ALERT;
             }
-
+#ifdef TARGET_BASED
+             if (!(ftpssn->flags & FTP_FLG_MALWARE_ENABLED) &&
+                     _dpd.fileAPI->file_config_malware_check(p->stream_session, ftp_data_app_id))
+             {
+                 ftpssn->flags |= FTP_FLG_MALWARE_ENABLED;
+             }
+#endif
             if (global_conf->inspection_type ==
                 FTPP_UI_CONFIG_STATEFUL)
             {
@@ -1825,6 +1800,7 @@ int check_ftp(FTP_SESSION  *ftpssn, SFSnortPacket *p, int iMode)
             DEBUG_WRAP(DebugMessage(DEBUG_FTPTELNET, "FTP command: CMD: %.*s : "
                 "P len %d : P %.*s\n", req->cmd_size, req->cmd_begin,
                 req->param_size, req->param_size, req->param_begin));
+
             if (CmdConf)
             {
                 if ((req->param_size > CmdConf->max_param_len))
@@ -1837,13 +1813,12 @@ int check_ftp(FTP_SESSION  *ftpssn, SFSnortPacket *p, int iMode)
                         req->cmd_size, req->cmd_begin, req->param_size,
                         CmdConf->max_param_len));
                     iRet = FTPP_ALERT;
-                    break;
                 }
 
                 if (CmdConf->data_chan_cmd)
                 {
                     ftpssn->data_chan_state |= DATA_CHAN_PASV_CMD_ISSUED;
-                    ftpssn->data_chan_index = ftp_cmd_pipe_index;
+                    ftpssn->data_chan_index = ftpssn->ftp_cmd_pipe_index;
                     if (ftpssn->data_chan_state & DATA_CHAN_PORT_CMD_ISSUED)
                     {
                         /*
@@ -1854,15 +1829,33 @@ int check_ftp(FTP_SESSION  *ftpssn, SFSnortPacket *p, int iMode)
                         ftpssn->data_chan_state &= ~DATA_CHAN_PORT_CMD_ISSUED;
                     }
                 }
+                else if (CmdConf->data_rest_cmd)
+                {
+                    if ((req->param_begin != NULL) && (req->param_size > 0))
+                    {
+                        char *return_ptr = 0;
+                        unsigned long offset = 0;
+
+                        errno = 0;
+                        offset = strtoul(req->param_begin, &return_ptr, 10);
+
+                        if ((errno == ERANGE || errno == EINVAL) || (offset > 0))
+                        {
+                            ftpssn->data_chan_state |= DATA_CHAN_REST_CMD_ISSUED;
+                            ftpssn->data_xfer_index = ftpssn->ftp_cmd_pipe_index;
+                            ftpssn->rest_cmd_offset = offset;
+                        }
+                    }
+                }
                 else if (CmdConf->data_xfer_cmd)
                 {
 #ifdef TARGET_BASED
                     /* If we are not ignoring the data channel OR file processing is enabled */
-                    if (!ftpssn->server_conf->data_chan || (_dpd.fileAPI->get_max_file_depth() > -1))
+                    if (!ftpssn->server_conf->data_chan || (_dpd.fileAPI->get_max_file_depth(_dpd.getCurrentSnortConfig(), false) > -1))
                     {
-                        /* The following  check cleans up filename  for failed data 
-                         * transfers.  If  the  transfer had  been  successful  the 
-                         * filename  pointer  would have  been  handed  off to  the 
+                        /* The following  check cleans up filename  for failed data
+                         * transfers.  If  the  transfer had  been  successful  the
+                         * filename  pointer  would have  been  handed  off to  the
                          * FTP_DATA_SESSION for tracking. */
                         if (ftpssn->filename)
                         {
@@ -1878,15 +1871,40 @@ int check_ftp(FTP_SESSION  *ftpssn, SFSnortPacket *p, int iMode)
                                 && (CmdConf->file_get_cmd || CmdConf->file_put_cmd))
                         {
                             ftpssn->filename = (char *)malloc(req->param_size+1);
+                            ftp_telnet_stats.heap_memory += req->param_size+1;
                             if (ftpssn->filename)
                             {
                                 memcpy(ftpssn->filename, req->param_begin, req->param_size);
                                 ftpssn->filename[req->param_size] = '\0';
                                 ftpssn->file_xfer_info = req->param_size;
+                                if (ftpssn->flags & FTP_FLG_MALWARE_ENABLED)
+                                {
+                                    IP_COPY_VALUE(ftpssn->control_clientIP, GET_SRC_IP(p));
+                                    IP_COPY_VALUE(ftpssn->control_serverIP, GET_DST_IP(p));
+                                    ftpssn->control_serverPort = ntohs(p->tcp_header->destination_port);
+                                    ftpssn->control_clientPort = ntohs(p->tcp_header->source_port);
+#ifdef TARGET_BASED
+                                    datassn = (FTP_DATA_SESSION *)ftpssn->datassn;
+                                    if(datassn)
+                                    {
+                                        char *file_name = strrchr(ftpssn->filename, '/');
+                                        if(!file_name)
+                                            file_name = ftpssn->filename;
+                                        datassn->path_hash = _dpd.fileAPI->str_to_hash((uint8_t *)file_name, strlen(file_name));
+                                    }
+#endif
+                                }
                             }
-
+                            else
+                            {
+                                _dpd.errMsg("check_ftp: "
+                                        "Memory allocation failed for filename in ftpssn\n");
+                            }
                             // 0 for Download, 1 for Upload
                             ftpssn->data_xfer_dir = CmdConf->file_get_cmd ? false : true;
+                            FTP_DATA_SESSION *ftpdata = ftpssn->datassn;
+                            if(ftpdata)
+                                ftpdata->direction = ftpssn->data_xfer_dir;
                         }
                         else
                         {
@@ -1895,7 +1913,7 @@ int check_ftp(FTP_SESSION  *ftpssn, SFSnortPacket *p, int iMode)
                     }
 #endif
                     ftpssn->data_chan_state |= DATA_CHAN_XFER_CMD_ISSUED;
-                    ftpssn->data_xfer_index = ftp_cmd_pipe_index;
+                    ftpssn->data_xfer_index = ftpssn->ftp_cmd_pipe_index;
                 }
                 else if (CmdConf->encr_cmd)
                 {
@@ -1939,7 +1957,7 @@ int check_ftp(FTP_SESSION  *ftpssn, SFSnortPacket *p, int iMode)
         }
 
         if (iMode == FTPP_SI_CLIENT_MODE)
-            ftp_cmd_pipe_index++;
+            ftpssn->ftp_cmd_pipe_index++;
         else if ((rsp_code != 226) && (rsp_code != 426))
         {
              /*
@@ -1949,13 +1967,13 @@ int check_ftp(FTP_SESSION  *ftpssn, SFSnortPacket *p, int iMode)
               * The 226 may or may not be sent by the server.
               * Both are 2nd response to a transfer command.
               */
-            ftp_cmd_pipe_index++;
+            ftpssn->ftp_cmd_pipe_index++;
         }
     }
 
     if (iMode == FTPP_SI_CLIENT_MODE)
     {
-        ftp_cmd_pipe_index = 0;
+        ftpssn->ftp_cmd_pipe_index = 1;
     }
 
     if (encrypted)

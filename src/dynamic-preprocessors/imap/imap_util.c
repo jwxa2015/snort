@@ -16,11 +16,11 @@
  * along with this program; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
  *
- * Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+ * Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
  * Copyright (C) 2011-2013 Sourcefire, Inc.
  *
  *
- * Author: Bhagyashree Bantwal <bbantwal@sourcefire.com>
+ * Author: Bhagyashree Bantwal <bbantwal@cisco.com>
  *
  * Description:
  *
@@ -40,6 +40,7 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include <string.h>
+#include <time.h>
 
 #ifdef HAVE_CONFIG_H
 #include "config.h"
@@ -56,6 +57,38 @@
 #include "Unified2_common.h"
 
 extern IMAP *imap_ssn;
+extern MemPool *imap_mempool;
+extern MemPool *imap_mime_mempool;
+
+int IMAP_Print_Mem_Stats(char *buffer)
+{
+    time_t curr_time = time(NULL);
+        
+    return snprintf(buffer, CS_STATS_BUF_SIZE, "\n\nMemory Statistics of IMAP on: %s\n"
+             "IMAP Session Statistics:\n"
+             "       Total Sessions seen: " STDu64 "\n"
+             "   Max concurrent sessions: " STDu64 "\n"
+             "   Current Active sessions: " STDu64 "\n"
+             "\n   Memory Pool:\n"
+             "        Free Memory:\n"
+             "            IMAP Mime Pool: %14zu bytes\n"
+             "                 IMAP Pool: %14zu bytes\n"
+             "        Used Memory:\n"
+             "            IMAP Mime Pool: %14zu bytes\n"
+             "                 IMAP Pool: %14zu bytes\n"
+             "        -------------------       ---------------\n"             
+             "        Total Memory:       %14zu bytes\n"
+             , ctime(&curr_time)
+             , imap_stats.sessions
+             , imap_stats.max_conc_sessions
+             , imap_stats.cur_sessions
+             , (imap_mime_mempool) ? (imap_mime_mempool->max_memory - imap_mime_mempool->used_memory) : 0
+             , (imap_mempool) ? (imap_mempool->max_memory - imap_mempool->used_memory) : 0
+             , (imap_mime_mempool) ? imap_mime_mempool->used_memory : 0
+             , (imap_mempool) ? imap_mempool->used_memory : 0
+             , ((imap_mime_mempool) ? (imap_mime_mempool->max_memory) : 0) +
+                          ((imap_mempool) ? (imap_mempool->max_memory) : 0));
+}
 
 void IMAP_GetEOL(const uint8_t *ptr, const uint8_t *end,
                  const uint8_t **eol, const uint8_t **eolm)
@@ -94,54 +127,6 @@ void IMAP_GetEOL(const uint8_t *ptr, const uint8_t *end,
     *eol = tmp_eol;
     *eolm = tmp_eolm;
 }
-
-void IMAP_DecodeType(const char *start, int length, bool cnt_xf)
-{
-    const char *tmp = NULL;
-
-    if(cnt_xf)
-    {
-
-        if(imap_ssn->decode_state->b64_state.encode_depth > -1)
-        {
-            tmp = _dpd.SnortStrcasestr(start, length, "base64");
-            if( tmp != NULL )
-            {
-                imap_ssn->decode_state->decode_type = DECODE_B64;
-                return;
-            }
-        }
-
-        if(imap_ssn->decode_state->qp_state.encode_depth > -1)
-        {
-            tmp = _dpd.SnortStrcasestr(start, length, "quoted-printable");
-            if( tmp != NULL )
-            {
-                imap_ssn->decode_state->decode_type = DECODE_QP;
-                return;
-            }
-        }
-
-        if(imap_ssn->decode_state->uu_state.encode_depth > -1)
-        {
-            tmp = _dpd.SnortStrcasestr(start, length, "uuencode");
-            if( tmp != NULL )
-            {
-                imap_ssn->decode_state->decode_type = DECODE_UU;
-                return;
-            }
-        }
-    }
-
-    if(imap_ssn->decode_state->bitenc_state.depth > -1)
-    {
-        imap_ssn->decode_state->decode_type = DECODE_BITENC;
-        return;
-    }
-
-    return;
-}
-
 
 #ifdef DEBUG_MSGS
 char imap_print_buffer[65537];

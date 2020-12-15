@@ -1,6 +1,6 @@
 /****************************************************************************
  *
- * Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+ * Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
  * Copyright (C) 2003-2013 Sourcefire, Inc.
  *
  * This program is free software; you can redistribute it and/or modify
@@ -141,6 +141,7 @@ int hi_split_header_cookie(HI_SESSION *Session, u_char *header, int *i_header_le
         if (last_cookie && (last_cookie != first_cookie))
         {
             free(last_cookie);
+            hi_stats.mem_used -= sizeof(COOKIE_PTR);
         }
         last_cookie = cookie;
         if (!cookie)

@@ -9,7 +9,7 @@
  */
 
 /*
- ** Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+ ** Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
  ** Copyright (C) 2004-2013 Sourcefire, Inc.
  **
  ** This program is free software; you can redistribute it and/or modify
@@ -113,6 +113,13 @@
 #include "profiler.h"
 
 #include "active.h"
+#include "session_api.h"
+#include "spp_normalize.h"
+#include "reload.h"
+
+#ifdef REG_TEST
+#include "reg_test.h"
+#endif
 
 #ifdef TARGET_BASED
 #include "sftarget_hostentry.h"
@@ -123,6 +130,7 @@
 extern OptTreeNode *otn_tmp;
 
 /*  D E F I N E S  **************************************************/
+#define PP_FRAG3_PRIORITY PRIORITY_CORE + PP_CORE_ORDER_FRAG3
 
 /* flags for the FragTracker->frag_flags field */
 #define FRAG_GOT_FIRST      0x00000001
@@ -159,6 +167,10 @@ extern OptTreeNode *otn_tmp;
 
 /* max frags in a single frag tracker */
 #define DEFAULT_MAX_FRAGS   8192
+
+/*max preallocated frags */
+#define MAX_PREALLOC_FRAGS 50000
+#define MIN_FRAG_MEMCAP 16384
 
 /* return values for CheckTimeout() */
 #define FRAG_TIME_OK            0
@@ -240,17 +252,30 @@ typedef struct _fragkey
     /* For 64 bit alignment since this is allocated in front of a FragTracker
      * and the structures are laid on top of that allocated memory */
 #ifdef HAVE_DAQ_ADDRESS_SPACE_ID
+#if !defined(SFLINUX) && defined(DAQ_CAPA_VRF)
+    uint16_t   address_space_id_src;
+    uint16_t   address_space_id_dst;
+#else
     uint16_t   addressSpaceId;
     uint16_t   addressSpaceIdPad1;
+#endif
 #else
     uint32_t   mpad;
 #endif
 #else
 #ifdef HAVE_DAQ_ADDRESS_SPACE_ID
+#if !defined(SFLINUX) && defined(DAQ_CAPA_VRF)
+    uint16_t   address_space_id_src;
+    uint16_t   address_space_id_dst;
+#else
     uint16_t   addressSpaceId;
     uint16_t   addressSpaceIdPad1;
+#endif
     uint32_t   addressSpaceIdPad2;
 #endif
+#endif
+#if !defined(SFLINUX) && defined(DAQ_CAPA_CARRIER_ID)
+    uint32_t   carrierId;
 #endif
 } FRAGKEY;
 
@@ -364,7 +389,7 @@ static Frag3Config *frag3_eval_config = NULL;
 static SFXHASH *f_cache = NULL;                 /* fragment hash table */
 static Frag3Frag *prealloc_frag_list = NULL;    /* head for prealloc queue */
 
-static unsigned long mem_in_use = 0;            /* memory in use, used for self pres */
+static unsigned long frag3_mem_in_use = 0;            /* memory in use, used for self pres */
 
 static uint32_t prealloc_nodes_in_use;  /* counter for debug */
 
@@ -376,6 +401,10 @@ static Packet* encap_defrag_pkt = NULL;
 #endif
 
 static uint32_t pkt_snaplen = 0;
+
+static uint32_t old_static_frags;
+static unsigned long hashTableSize;
+static unsigned long fcache_new_memcap;
 
 /* enum for policy names */
 static char *frag_policy_names[] = { "no policy!",
@@ -420,6 +449,8 @@ static void Frag3ReloadEngine(struct _SnortConfig *, char *, void **);
 static int Frag3ReloadVerify(struct _SnortConfig *, void *);
 static void * Frag3ReloadSwap(struct _SnortConfig *, void *);
 static void Frag3ReloadSwapFree(void *);
+static uint32_t Frag3MemReloadAdjust(unsigned);
+static bool Frag3ReloadAdjust(bool, tSfPolicyId, void *);
 #endif
 
 /* deletion funcs */
@@ -452,7 +483,7 @@ static void Frag3PostConfigInit(struct _SnortConfig *, void *);
 char *FragIPToStr(uint32_t ip[4], uint8_t proto)
 {
     char *ret_str;
-    sfip_t srcip;
+    sfaddr_t srcip;
     sfip_set_raw(&srcip, ip, proto == 4 ? AF_INET : AF_INET6);
 
     ret_str = sfip_to_str(&srcip);
@@ -513,6 +544,9 @@ static void PrintFragKey(FRAGKEY *fkey)
 #endif
 #ifdef HAVE_DAQ_ADDRESS_SPACE_ID
         LogMessage(" addr id: %d\n", fkey->addressSpaceId);
+#endif
+#if !defined(SFLINUX) && defined(DAQ_CAPA_CARRIER_ID)
+        LogMessage(" carrier id: %u\n", fkey->carrierId);
 #endif
     }
 }
@@ -938,6 +972,10 @@ uint32_t Frag3KeyHashFunc(SFHASHFCN *p, unsigned char *d, int n)
     tmp2 = *(uint32_t*)(d+offset); /* after offset that has been moved */
     c += tmp2; /* address space id and 16bits of zero'd pad */
 #endif
+#if !defined(SFLINUX) && defined(DAQ_CAPA_CARRIER_ID)
+    mix(a,b,c);
+    a += *(uint32_t*)(d+offset+4);
+#endif
 
     final(a,b,c);
 
@@ -999,6 +1037,16 @@ int Frag3KeyCmpFunc(const void *s1, const void *s2, size_t n)
     }
 #endif
 #endif
+#if !defined(SFLINUX) && defined(DAQ_CAPA_CARRIER_ID)
+    a++;
+    b++;
+    {
+        uint32_t *x, *y;
+        x = (uint32_t *)a;
+        y = (uint32_t *)b;
+        if (*x - *y) return 1; /* Compares carrierID */
+    }
+#endif
 
 #else /* SPARCV9 */
     uint32_t *a,*b;
@@ -1053,6 +1101,16 @@ int Frag3KeyCmpFunc(const void *s1, const void *s2, size_t n)
         if (*x - *y) return 1;  /* Compares addressSpaceID, no pad */
     }
 #endif
+#if !defined(SFLINUX) && defined(DAQ_CAPA_CARRIER_ID)
+    a++;
+    b++;
+    {
+        uint32_t *x, *y;
+        x = (uint32_t *)a;
+        y = (uint32_t *)b;
+        if (*x - *y) return 1; /* Compares carrierID */
+    }
+#endif
 #endif /* SPARCV9 */
 
     return 0;
@@ -1084,14 +1142,14 @@ static void Frag3GlobalInit(struct _SnortConfig *sc, char *args)
 #endif
 
 #ifdef PERF_PROFILING
-        RegisterPreprocessorProfile("frag3", &frag3PerfStats, 0, &totalPerfStats);
-        RegisterPreprocessorProfile("frag3insert", &frag3InsertPerfStats, 1, &frag3PerfStats);
-        RegisterPreprocessorProfile("frag3rebuild", &frag3RebuildPerfStats, 1, &frag3PerfStats);
+        RegisterPreprocessorProfile("frag3", &frag3PerfStats, 0, &totalPerfStats, NULL);
+        RegisterPreprocessorProfile("frag3insert", &frag3InsertPerfStats, 1, &frag3PerfStats, NULL);
+        RegisterPreprocessorProfile("frag3rebuild", &frag3RebuildPerfStats, 1, &frag3PerfStats, NULL);
 #endif
 
-        AddFuncToPreprocCleanExitList(Frag3CleanExit, NULL, PRIORITY_NETWORK, PP_FRAG3);
-        AddFuncToPreprocResetList(Frag3Reset, NULL, PRIORITY_NETWORK, PP_FRAG3);
-        AddFuncToPreprocResetStatsList(Frag3ResetStats, NULL, PRIORITY_NETWORK, PP_FRAG3);
+        AddFuncToPreprocCleanExitList(Frag3CleanExit, NULL, PP_FRAG3_PRIORITY, PP_FRAG3);
+        AddFuncToPreprocResetList(Frag3Reset, NULL, PP_FRAG3_PRIORITY, PP_FRAG3);
+        AddFuncToPreprocResetStatsList(Frag3ResetStats, NULL, PP_FRAG3_PRIORITY, PP_FRAG3);
         AddFuncToConfigCheckList(sc, Frag3VerifyConfig);
         AddFuncToPreprocPostConfigList(sc, Frag3PostConfigInit, NULL);
         RegisterPreprocStats("frag3", Frag3PrintStats);
@@ -1142,7 +1200,7 @@ static void Frag3GlobalInit(struct _SnortConfig *sc, char *args)
     if(f_cache == NULL)
     {
         /* we keep FragTrackers in the hash table.. */
-        unsigned long hashTableSize = (unsigned long) (pCurrentPolicyConfig->max_frags * 1.4);
+        hashTableSize = (unsigned long) (pCurrentPolicyConfig->max_frags * 1.4);
         unsigned long maxFragMem = pCurrentPolicyConfig->max_frags * (
                             sizeof(FragTracker) +
                             sizeof(SFXHASH_NODE) +
@@ -1176,13 +1234,16 @@ static void Frag3GlobalInit(struct _SnortConfig *sc, char *args)
 
 #ifdef REG_TEST
     LogMessage("\n");
-    LogMessage("    FragTracker Size: %lu\n",sizeof(FragTracker));
+    LogMessage("    FragTracker Size: %lu\n",(unsigned long)sizeof(FragTracker));
     LogMessage("\n");
 #endif
 
     /* register the preprocessor func node */
     if ( !pCurrentPolicyConfig->disabled )
-        AddFuncToPreprocList(sc, Frag3Defrag, PRIORITY_NETWORK, PP_FRAG3, PROTO_BIT__IP);
+    {
+        AddFuncToPreprocList(sc, Frag3Defrag, PP_FRAG3_PRIORITY, PP_FRAG3, PROTO_BIT__IP);
+        session_api->enable_preproc_all_ports( sc, PP_FRAG3, PROTO_BIT__IP );
+    }
 }
 
 /**
@@ -1472,7 +1533,7 @@ static void Frag3ParseGlobalArgs(Frag3Config *gconfig, char *args)
                            file_line);
             }
 
-            if (gconfig->memcap < 16384)
+            if (gconfig->memcap < MIN_FRAG_MEMCAP)
             {
                 LogMessage("WARNING: %s(%d) => Ludicrous (<16k) memcap "
                            "size, setting to default (%d bytes)\n",
@@ -1505,7 +1566,7 @@ static void Frag3ParseGlobalArgs(Frag3Config *gconfig, char *args)
                            file_line);
             }
 
-            if(memcap < 16384)
+            if(memcap <MIN_FRAG_MEMCAP)
             {
                 LogMessage("WARNING: %s(%d) => Ludicrous (<16k) prealloc_memcap "
                            "size, setting to default (%d bytes)\n",
@@ -1528,11 +1589,11 @@ static void Frag3ParseGlobalArgs(Frag3Config *gconfig, char *args)
             gconfig->static_frags = value = strtoul(stoks[1], &endPtr, 10);
             gconfig->use_prealloc_frags = gconfig->use_prealloc = 1;
 
-            if (!*stoks[1] || *stoks[1] == '-' || *endPtr)
+            if (!*stoks[1] || *stoks[1] == '-' || *endPtr || value > MAX_PREALLOC_FRAGS)
             {
-                FatalError("%s(%d) => Invalid prealloc_frags in config file. "
-                           "Integer parameter required.\n", file_name,
-                           file_line);
+                FatalError("%s(%d) => Invalid prealloc_frags in config file. Entered value is not allowed. "
+                        "Integer parameter (in the range of 0 to %d) required.\n", file_name,
+                        file_line,MAX_PREALLOC_FRAGS);
             }
         }
         else if(!strcasecmp(stoks[0], "disabled"))
@@ -1729,7 +1790,7 @@ static void Frag3Defrag(Packet *p, void *context)
     Frag3Context *f3context = NULL; /* engine context */
     int engineIndex;
     int insert_return = 0;   /* return value from the insert function */
-    tSfPolicyId policy_id = getRuntimePolicy();
+    tSfPolicyId policy_id = getNapRuntimePolicy();
     PROFILE_VARS;
 
     // preconditions - what we registered for
@@ -1803,9 +1864,7 @@ static void Frag3Defrag(Packet *p, void *context)
      */
     if ((p->frag_offset != 0) || ((GET_IPH_PROTO(p) != IPPROTO_UDP) && (p->mf)))
     {
-        DisableDetect(p);
-        SetPreprocBit(p, PP_SFPORTSCAN);
-        SetPreprocBit(p, PP_PERFMONITOR);
+        DisableDetect( p );
         otn_tmp = NULL;
     }
 
@@ -1840,7 +1899,7 @@ static void Frag3Defrag(Packet *p, void *context)
                 "[FRAG3] Got frag packet (mem use: %ld frag "
                 "trackers: %d  p->pkt_flags: 0x%X "
                 "prealloc nodes in use: %lu/%lu)\n",
-                mem_in_use,
+                frag3_mem_in_use,
                 sfxhash_count(f_cache),
                 p->packet_flags, prealloc_nodes_in_use,
                 frag3_eval_config->static_frags););
@@ -1863,7 +1922,7 @@ static void Frag3Defrag(Packet *p, void *context)
                     "[FRAG3] mem use: %ld frag "
                     "trackers: %d  prealloc "
                     "nodes in use: %lu/%lu\n",
-                    mem_in_use,
+                    frag3_mem_in_use,
                     sfxhash_count(f_cache),
                     prealloc_nodes_in_use,
                     frag3_eval_config->static_frags););
@@ -1911,9 +1970,14 @@ static void Frag3Defrag(Packet *p, void *context)
     {
         DEBUG_WRAP(DebugMessage(DEBUG_FRAG,
                     "Blocking fragments due to earlier fragment drop\n"););
-        DisableDetect(p);
-        SetPreprocBit(p, PP_PERFMONITOR);
-        Active_DropPacket(p);
+        DisableDetect( p );
+        Active_DAQDropPacket( p );
+        if (pkt_trace_enabled)
+        {
+            addPktTraceData(VERDICT_REASON_DEFRAG, snprintf(trace_line, MAX_TRACE_LINE,
+                "Defragmentation: earlier fragment was already blocked, %s\n", getPktTraceActMsg()));
+        }
+        else addPktTraceData(VERDICT_REASON_DEFRAG, 0);
         f3stats.drops++;
     }
 
@@ -2016,7 +2080,7 @@ static void Frag3Defrag(Packet *p, void *context)
             DEBUG_WRAP(DebugMessage(DEBUG_FRAG,
                         "[FRAG3] Dumped fragtracker (mem use: %ld frag "
                         "trackers: %d  prealloc nodes in use: %lu/%lu)\n",
-                        mem_in_use, sfxhash_count(f_cache),
+                        frag3_mem_in_use, sfxhash_count(f_cache),
                         prealloc_nodes_in_use, frag3_eval_config->static_frags););
         }
     }
@@ -2046,7 +2110,6 @@ static inline int CheckTimeout(struct timeval *current_time,
                                current_time and start_time */
 
     TIMERSUB(current_time, start_time, &tv_diff);
-
     if(tv_diff.tv_sec >= (int)f3context->frag_timeout)
     {
         return FRAG_TIMEOUT;
@@ -2109,25 +2172,6 @@ static inline int Frag3Expire(Packet *p, FragTracker *ft, Frag3Context *f3contex
     }
 
     return FRAG_OK;
-}
-
-static inline void FragEvent(Packet *p, int gid, char *str,
-                             int event_flag, int drop_flag)
-{
-    if (ScIdsMode() && event_flag)
-    {
-        SnortEventqAdd(GENERATOR_SPP_FRAG3, gid, 1,
-                       DECODE_CLASS, 3, str, 0);
-
-        if ( drop_flag )
-        {
-            DEBUG_WRAP(DebugMessage(DEBUG_DECODE, "Dropping bad packet\n"););
-            Active_DropSession(p);
-        }
-    }
-
-    f3stats.alerts++;
-    f3stats.anomalies++;
 }
 
 /**
@@ -2265,8 +2309,8 @@ static FragTracker *Frag3GetTracker(Packet *p, FRAGKEY *fkey)
      */
     if (IS_IP4(p))
     {
-        COPY4(fkey->sip, p->ip4h->ip_src.ip32);
-        COPY4(fkey->dip, p->ip4h->ip_dst.ip32);
+        COPY4(fkey->sip, sfaddr_get_ip6_ptr(&p->ip4h->ip_addrs->ip_src));
+        COPY4(fkey->dip, sfaddr_get_ip6_ptr(&p->ip4h->ip_addrs->ip_dst));
         fkey->id = GET_IPH_ID(p);
         fkey->ipver = 4;
         fkey->proto = GET_IPH_PROTO(p);
@@ -2274,8 +2318,8 @@ static FragTracker *Frag3GetTracker(Packet *p, FRAGKEY *fkey)
     else
     {
         IP6Frag *fragHdr;
-        COPY4(fkey->sip, p->ip6h->ip_src.ip32);
-        COPY4(fkey->dip, p->ip6h->ip_dst.ip32);
+        COPY4(fkey->sip, sfaddr_get_ip6_ptr(&p->ip6h->ip_addrs->ip_src));
+        COPY4(fkey->dip, sfaddr_get_ip6_ptr(&p->ip6h->ip_addrs->ip_dst));
         fkey->ipver = 6;
         /* Data points to the offset, and does not include the next hdr
          * and reserved.  Offset it by -2 to get there */
@@ -2299,10 +2343,18 @@ static FragTracker *Frag3GetTracker(Packet *p, FRAGKEY *fkey)
 #endif
 
 #ifdef HAVE_DAQ_ADDRESS_SPACE_ID
+#if !defined(SFLINUX) && defined(DAQ_CAPA_VRF)
+    fkey->address_space_id_dst = DAQ_GetDestinationAddressSpaceID(p->pkth); 
+    fkey->address_space_id_src = DAQ_GetSourceAddressSpaceID(p->pkth); 
+#else
     if (!ScAddressSpaceAgnostic())
         fkey->addressSpaceId = DAQ_GetAddressSpaceID(p->pkth);
     else
         fkey->addressSpaceId = 0;
+#endif
+#endif
+#if !defined(SFLINUX) && defined(DAQ_CAPA_CARRIER_ID)
+    fkey->carrierId = p->pkth->carrier_id;
 #endif
 
     /*
@@ -2407,7 +2459,7 @@ int FragGetPolicy(Packet *p, Frag3Context *f3context)
      * to.  */
     HostAttributeEntry *host_entry;
 
-    if (!IsAdaptiveConfigured(getRuntimePolicy()))
+    if (!IsAdaptiveConfigured())
         return f3context->frag_policy;
 
     host_entry = SFAT_LookupHostEntryByDst(p);
@@ -2454,7 +2506,7 @@ static int Frag3NewTracker(Packet *p, FRAGKEY *fkey, Frag3Context *f3context)
     uint16_t fragLength;
     uint16_t frag_end;
     SFXHASH_NODE *hnode;
-    tSfPolicyId policy_id = getRuntimePolicy();
+    tSfPolicyId policy_id = getNapRuntimePolicy();
 
     fragStart = p->ip_frag_start;
     //fragStart = (uint8_t *)p->iph + GET_IPH_HLEN(p) * 4;
@@ -2495,7 +2547,7 @@ static int Frag3NewTracker(Packet *p, FRAGKEY *fkey, Frag3Context *f3context)
 
     tmp = (FragTracker *)hnode->data;
     memset(tmp, 0, sizeof(FragTracker));
-    
+
     /*
      * setup the frag tracker
      */
@@ -2543,7 +2595,7 @@ static int Frag3NewTracker(Packet *p, FRAGKEY *fkey, Frag3Context *f3context)
      */
     if(!frag3_eval_config->use_prealloc)
     {
-        if(mem_in_use > frag3_eval_config->memcap)
+        if(frag3_mem_in_use > frag3_eval_config->memcap)
         {
             if (Frag3Prune(tmp) == 0)
             {
@@ -2555,12 +2607,12 @@ static int Frag3NewTracker(Packet *p, FRAGKEY *fkey, Frag3Context *f3context)
         }
 
         f = (Frag3Frag *) SnortAlloc(sizeof(Frag3Frag));
-        mem_in_use += sizeof(Frag3Frag);
+        frag3_mem_in_use += sizeof(Frag3Frag);
 
         f->fptr = (uint8_t *) SnortAlloc(fragLength);
-        mem_in_use += fragLength;
+        frag3_mem_in_use += fragLength;
 
-        sfBase.frag3_mem_in_use = mem_in_use;
+        sfBase.frag3_mem_in_use = frag3_mem_in_use;
     }
     else
     {
@@ -2732,7 +2784,7 @@ static int AddFragNode(FragTracker *ft,
      */
     if(!frag3_eval_config->use_prealloc)
     {
-        if(mem_in_use > frag3_eval_config->memcap)
+        if(frag3_mem_in_use > frag3_eval_config->memcap)
         {
             if (Frag3Prune(ft) == 0)
             {
@@ -2747,15 +2799,15 @@ static int AddFragNode(FragTracker *ft,
          * build a frag struct to track this particular fragment
          */
         newfrag = (Frag3Frag *) SnortAlloc(sizeof(Frag3Frag));
-        mem_in_use += sizeof(Frag3Frag);
+        frag3_mem_in_use += sizeof(Frag3Frag);
 
         /*
          * allocate some space to hold the actual data
          */
         newfrag->fptr = (uint8_t*)SnortAlloc(fragLength);
-        mem_in_use += fragLength;
+        frag3_mem_in_use += fragLength;
 
-        sfBase.frag3_mem_in_use = mem_in_use;
+        sfBase.frag3_mem_in_use = frag3_mem_in_use;
     }
     else
     {
@@ -2843,7 +2895,7 @@ static int DupFragNode(FragTracker *ft,
      */
     if(!frag3_eval_config->use_prealloc)
     {
-        if(mem_in_use > frag3_eval_config->memcap)
+        if(frag3_mem_in_use > frag3_eval_config->memcap)
         {
             if (Frag3Prune(ft) == 0)
             {
@@ -2858,15 +2910,15 @@ static int DupFragNode(FragTracker *ft,
          * build a frag struct to track this particular fragment
          */
         newfrag = (Frag3Frag *) SnortAlloc(sizeof(Frag3Frag));
-        mem_in_use += sizeof(Frag3Frag);
+        frag3_mem_in_use += sizeof(Frag3Frag);
 
         /*
          * allocate some space to hold the actual data
          */
         newfrag->fptr = (uint8_t*)SnortAlloc(left->flen);
-        mem_in_use += left->flen;
+        frag3_mem_in_use += left->flen;
 
-        sfBase.frag3_mem_in_use = mem_in_use;
+        sfBase.frag3_mem_in_use = frag3_mem_in_use;
     }
     else
     {
@@ -3009,7 +3061,7 @@ static int Frag3Insert(Packet *p, FragTracker *ft, FRAGKEY *fkey,
 {
     uint16_t orig_offset;    /* offset specified in this fragment header */
     uint16_t frag_offset;    /* calculated offset for this fragment */
-    uint16_t frag_end;       /* calculated end point for this fragment */
+    uint32_t frag_end;       /* calculated end point for this fragment */
     int16_t trunc = 0;      /* we truncate off the tail */
     int32_t overlap = 0;    /* we overlap on either end of the frag */
     int16_t len = 0;        /* calculated size of the fragment */
@@ -3028,6 +3080,7 @@ static int Frag3Insert(Packet *p, FragTracker *ft, FRAGKEY *fkey,
     Frag3Frag *dump_me = NULL;  /* frag ptr for complete overlaps to dump */
     const uint8_t *fragStart;
     int16_t fragLength;
+    uint32_t reassembled_pkt_size;
     PROFILE_VARS;
 
     sfBase.iFragInserts++;
@@ -3074,6 +3127,12 @@ static int Frag3Insert(Packet *p, FragTracker *ft, FRAGKEY *fkey,
     if (firstLastOk == FRAG_LAST_OFFSET_ADJUST)
         frag_offset = (uint16_t)ft->calculated_size;
     frag_end = frag_offset + fragLength;
+
+    /*
+     * Copy the calculated size of the reassembled
+     * packet in a local variable.
+     */
+    reassembled_pkt_size = ft->calculated_size;
 
     /*
      * might have last frag...
@@ -3154,7 +3213,7 @@ static int Frag3Insert(Packet *p, FragTracker *ft, FRAGKEY *fkey,
         return FRAG_INSERT_ANOMALY;
     }
 
-    if(ft->calculated_size > IP_MAXPACKET)
+    if(frag_end > IP_MAXPACKET)
     {
         /*
          * oversize pkt...
@@ -3165,6 +3224,11 @@ static int Frag3Insert(Packet *p, FragTracker *ft, FRAGKEY *fkey,
             EventAnomBadsizeLg(f3context);
 
         ft->frag_flags |= FRAG_BAD;
+
+	/*
+         * Restore the value of ft->calculated_size
+         */
+        ft->calculated_size = reassembled_pkt_size;
 
         PREPROC_PROFILE_END(frag3InsertPerfStats);
         return FRAG_INSERT_ANOMALY;
@@ -4027,12 +4091,12 @@ static void Frag3DeleteFrag(Frag3Frag *frag)
     if(!frag3_eval_config->use_prealloc)
     {
         free(frag->fptr);
-        mem_in_use -= frag->flen;
+        frag3_mem_in_use -= frag->flen;
 
         free(frag);
-        mem_in_use -= sizeof(Frag3Frag);
+        frag3_mem_in_use -= sizeof(Frag3Frag);
 
-        sfBase.frag3_mem_in_use = mem_in_use;
+        sfBase.frag3_mem_in_use = frag3_mem_in_use;
     }
     else
     {
@@ -4232,10 +4296,10 @@ static int Frag3Prune(FragTracker *not_me)
 
     if(!frag3_eval_config->use_prealloc)
     {
-        //while(mem_in_use > (frag3_eval_config->memcap-globa_config->ten_percent))
+        //while(frag3_mem_in_use > (frag3_eval_config->memcap-globa_config->ten_percent))
         DEBUG_WRAP(DebugMessage(DEBUG_FRAG,
                     "(spp_frag3) Frag3Prune: Pruning by memcap! "););
-        while((mem_in_use > frag3_eval_config->memcap) ||
+        while((frag3_mem_in_use > frag3_eval_config->memcap) ||
               (f_cache->count > (frag3_eval_config->max_frags - 5)))
         {
             hnode = sfxhash_lru_node(f_cache);
@@ -4836,12 +4900,22 @@ static void Frag3ReloadGlobal(struct _SnortConfig *sc, char *args, void **new_co
             (sizeof(Frag3Frag) + sizeof(uint8_t) * pkt_snaplen) + 1;
 
         pCurrentPolicyConfig->ten_percent = pCurrentPolicyConfig->static_frags >> 5;
+#ifdef REG_TEST
+        if (REG_TEST_FLAG_RELOAD & getRegTestFlags())
+        {
+            printf("static frags is zero and memcap     : %lu\n",pCurrentPolicyConfig->memcap);
+            printf("updated static_frags count          : %u\n",pCurrentPolicyConfig->static_frags);
+        }
+#endif
     }
 
     Frag3PrintGlobalConfig(pCurrentPolicyConfig);
 
     if ( !pCurrentPolicyConfig->disabled )
-        AddFuncToPreprocList(sc, Frag3Defrag, PRIORITY_NETWORK, PP_FRAG3, PROTO_BIT__IP);
+    {
+        AddFuncToPreprocList(sc, Frag3Defrag, PP_FRAG3_PRIORITY, PP_FRAG3, PROTO_BIT__IP);
+        session_api->enable_preproc_all_ports( sc, PP_FRAG3, PROTO_BIT__IP );
+    }
 }
 
 static void Frag3ReloadEngine(struct _SnortConfig *sc, char *args, void **new_config)
@@ -4926,12 +5000,126 @@ static int Frag3ReloadVerifyPolicy(
     return 0;
 }
 
+static uint32_t Frag3MemReloadAdjust(unsigned maxWork)
+{
+     Frag3Frag *tmp;
+     SFXHASH_NODE *hnode;
+#ifdef REG_TEST
+     static uint32_t addstaticfrag_cnt, delstaticfrag_cnt;
+#endif
+
+     Frag3Config *newConfig = (Frag3Config *)sfPolicyUserDataGetCurrent(frag3_config);
+     pkt_snaplen = DAQ_GetSnapLen();
+
+     if(newConfig->static_frags == old_static_frags)
+	 return maxWork;
+
+     else if(newConfig->static_frags > old_static_frags)
+     {
+	if(newConfig->use_prealloc)
+	{
+	   for(;maxWork && (newConfig->static_frags > old_static_frags); maxWork--,old_static_frags++)
+	   {
+                tmp = (Frag3Frag *) SnortAlloc(sizeof(Frag3Frag));
+                tmp->fptr = (uint8_t *) SnortAlloc(sizeof(uint8_t) * pkt_snaplen);
+                Frag3PreallocPush(tmp);
+		prealloc_nodes_in_use++;
+#ifdef REG_TEST
+		addstaticfrag_cnt++;
+#endif
+	   }
+	}
+     }
+     else
+     {
+        for(;maxWork && (newConfig->static_frags < old_static_frags); maxWork--,old_static_frags--)
+        {
+	   tmp = Frag3PreallocPop();
+           if (tmp)
+           {
+                free(tmp->fptr);
+                free(tmp);
+	        prealloc_nodes_in_use--;
+#ifdef REG_TEST
+                delstaticfrag_cnt++;
+#endif
+          }
+	  else
+	  {
+	    /*exhausted prealloc frags */
+	    break;
+	  }
+	}
+	if(maxWork && (newConfig->static_frags < old_static_frags))
+	{
+            for (;maxWork && (newConfig->static_frags < old_static_frags); maxWork--,old_static_frags--)
+            {
+                 hnode = sfxhash_lru_node(f_cache);
+                if (hnode)
+                {
+                        Frag3RemoveTracker(hnode->key, hnode->data);
+			tmp = Frag3PreallocPop();
+		        if (tmp)
+	                {
+		             free(tmp->fptr);
+		             free(tmp);
+			     prealloc_nodes_in_use--;
+		        }
+#ifdef REG_TEST
+		        delstaticfrag_cnt++;
+#endif
+                 }
+            }
+	}
+     }
+#ifdef REG_TEST
+        if (REG_TEST_FLAG_RELOAD & getRegTestFlags())
+        {
+            if(newConfig->static_frags == old_static_frags)
+	    {
+		if(addstaticfrag_cnt)
+			printf("Total prealloc frag nodes added    : %u\n",addstaticfrag_cnt);
+		if(delstaticfrag_cnt)
+			printf("Total prealloc frag nodes deleted  : %u\n",delstaticfrag_cnt);
+	    }
+        }
+#endif
+     return maxWork;
+}
+
+static bool Frag3ReloadAdjust(bool idle, tSfPolicyId raPolicyId, void* userData)
+{
+   unsigned initialMaxWork = idle ? 2048 : 5;
+   unsigned maxWork;
+   int iRet = -1;
+
+   maxWork = Frag3MemReloadAdjust(initialMaxWork);
+
+   if(maxWork)
+   {
+     iRet = sfxhash_change_memcap(f_cache, fcache_new_memcap, &maxWork);
+
+#ifdef REG_TEST
+     if(iRet == SFXHASH_OK && maxWork)
+     {
+       if (REG_TEST_FLAG_RELOAD & getRegTestFlags())
+       {
+          printf("Successfully updated Frag cache memcap :%lu\n",f_cache->mc.memcap);
+       }
+     }
+#endif
+   }
+   return (maxWork != 0) ? true : false;
+}
+
+
 static int Frag3ReloadVerify(struct _SnortConfig *sc, void *swap_config)
 {
     int rval;
     tSfPolicyUserContextId frag3_swap_config = (tSfPolicyUserContextId)swap_config;
     Frag3Config *pCurrDefaultPolicyConfig = NULL;
     Frag3Config *pSwapDefaultPolicyConfig = NULL;
+    tSfPolicyId policy_id = 0;
 
     pCurrDefaultPolicyConfig = (Frag3Config *)sfPolicyUserDataGetDefault(frag3_config);
     pSwapDefaultPolicyConfig = (Frag3Config *)sfPolicyUserDataGetDefault(frag3_swap_config);
@@ -4942,14 +5130,34 @@ static int Frag3ReloadVerify(struct _SnortConfig *sc, void *swap_config)
     if ((rval = sfPolicyUserDataIterate (sc, frag3_swap_config, Frag3ReloadVerifyPolicy)))
         return rval;
 
-    if ((pSwapDefaultPolicyConfig->memcap != pCurrDefaultPolicyConfig->memcap) ||
-        (pSwapDefaultPolicyConfig->max_frags != pCurrDefaultPolicyConfig->max_frags) ||
-        (pSwapDefaultPolicyConfig->use_prealloc != pCurrDefaultPolicyConfig->use_prealloc) ||
-        (pSwapDefaultPolicyConfig->static_frags != pCurrDefaultPolicyConfig->static_frags))
+    policy_id = getParserPolicy(sc);
+    if ((pSwapDefaultPolicyConfig->static_frags != pCurrDefaultPolicyConfig->static_frags) ||
+	(pSwapDefaultPolicyConfig->max_frags != pCurrDefaultPolicyConfig->max_frags))
     {
-        ErrorMessage("Frag3 Reload: Changing \"prealloc_frags\", \"memcap\", "
-                     "\"max_frags\" or \"prealloc_memcap\" requires a restart.\n");
-        return -1;
+	unsigned long max_frag_mem, table_mem;
+
+        old_static_frags = pCurrDefaultPolicyConfig->static_frags;
+
+        max_frag_mem = pSwapDefaultPolicyConfig->max_frags * (
+               sizeof(FragTracker) +
+               sizeof(SFXHASH_NODE) +
+               sizeof (FRAGKEY) +
+               sizeof(SFXHASH_NODE *));
+        table_mem = (hashTableSize + 1) * sizeof(SFXHASH_NODE *);
+        fcache_new_memcap = max_frag_mem + table_mem;
+
+#ifdef REG_TEST
+          if (REG_TEST_FLAG_RELOAD & getRegTestFlags())
+          {
+             printf("prealloc static frags old conf : %d new conf : %d\n",old_static_frags,pSwapDefaultPolicyConfig->static_frags);
+             if (pSwapDefaultPolicyConfig->use_prealloc)
+                printf("use_prealloc is enabled!\n");
+             else
+               printf("use_prealloc is disabled!\n");
+	     printf("Frag cache new memcap value: %lu\n",fcache_new_memcap);
+          }
+#endif
+          ReloadAdjustRegister(sc, "Frag3Reload", policy_id, &Frag3ReloadAdjust, NULL, NULL);
     }
 
     return 0;

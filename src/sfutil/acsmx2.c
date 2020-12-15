@@ -3,7 +3,7 @@
 **
 ** Copyright(C) 2002,2003,2004 Marc Norton
 ** Copyright(C) 2003,2004 Daniel Roelker
-** Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+** Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
 ** Copyright (C) 2002-2013 Sourcefire, Inc.
 **
 ** This program is free software; you can redistribute it and/or modify
@@ -137,15 +137,20 @@
 
 #include "sf_types.h"
 
+#ifndef DYNAMIC_PREPROC_CONTEXT
 #define ACSMX2_TRACK_Q
 
 #ifdef  ACSMX2_TRACK_Q
 # include "snort.h"
 #endif
+#endif //DYNAMIC_PREPROC_CONTEXT
 
 #include "acsmx2.h"
 #include "util.h"
 #include "snort_debug.h"
+#ifdef DYNAMIC_PREPROC_CONTEXT
+#include "sf_dynamic_preprocessor.h"
+#endif //DYNAMIC_PREPROC_CONTEXT
 
 #define printf LogMessage
 
@@ -441,30 +446,12 @@ queue_init (QUEUE * s)
 }
 
 /*
-*  Find a State in the queue
-*/
-static int
-queue_find (QUEUE * s, int state)
-{
-  QNODE * q;
-  q = s->head;
-  while( q )
-  {
-      if( q->state == state ) return 1;
-      q = q->next;
-  }
-  return 0;
-}
-
-/*
 *  Add Tail Item to queue (FiFo/LiLo)
 */
 static void
 queue_add (QUEUE * s, int state)
 {
   QNODE * q;
-
-  if( queue_find( s, state ) ) return;
 
   if (!s->head)
   {
@@ -558,6 +545,25 @@ int List_GetNextState( ACSM_STRUCT2 * acsm, int state, int input )
 }
 
 /*
+*  Get Next State-NFA, using direct index to speed up search
+*/
+static int List_GetNextStateOpt( ACSM_STRUCT2 * acsm,
+    trans_node_t **acsmTransTableOpt, int state, int input )
+{
+  trans_node_t * t;
+  int index = state * acsm->acsmAlphabetSize + input;
+
+  t = acsmTransTableOpt[index];
+
+  if (t)
+      return t->next_state;
+
+  if( state == 0 ) return 0;
+
+  return ACSM_FAIL_STATE2; /* Fail state ??? */
+}
+
+/*
 *  Get Next State-DFA
 */
 static
@@ -617,6 +623,46 @@ int List_PutNextState( ACSM_STRUCT2 * acsm, int state, int input, int next_state
 
   return 0;
 }
+
+/*
+*  Put Next State - Head insertion, and transition updates
+*/
+static
+int List_PutNextStateOpt( ACSM_STRUCT2 * acsm, trans_node_t **acsmTransTableOpt,
+    int state, int input, int next_state )
+{
+  trans_node_t * tnew;
+  trans_node_t *t;
+  int index = state * acsm->acsmAlphabetSize + input;
+
+  t = acsmTransTableOpt[index];
+
+  if (t)
+  {
+        t->next_state = next_state;
+        return 0;
+  }
+
+
+  /* Definitely not an existing transition - add it */
+  tnew = (trans_node_t*)AC_MALLOC(sizeof(trans_node_t),
+          ACSM2_MEMORY_TYPE__TRANSTABLE);
+  if( !tnew ) return -1;
+
+  tnew->key        = input;
+  tnew->next_state = next_state;
+  tnew->next       = 0;
+
+  tnew->next = acsm->acsmTransTable[state];
+  acsm->acsmTransTable[state] = tnew;
+
+  acsm->acsmNumTrans++;
+
+  acsmTransTableOpt[index] = tnew;
+
+  return 0;
+}
+
 /*
 *   Free the entire transition table
 */
@@ -723,7 +769,7 @@ int List_PrintTransTable( ACSM_STRUCT2 * acsm )
 /*
 *   Converts row of states from list to a full vector format
 */
-static int
+static inline int
 List_ConvToFull(
         ACSM_STRUCT2 *acsm,
         acstate_t state,
@@ -732,8 +778,6 @@ List_ConvToFull(
 {
     int tcnt = 0;
     trans_node_t *t = acsm->acsmTransTable[state];
-
-    memset(full, 0, acsm->sizeofstate * acsm->acsmAlphabetSize);
 
     if (t == NULL)
         return 0;
@@ -881,9 +925,11 @@ Build_NFA (ACSM_STRUCT2 * acsm)
     acstate_t     * FailState = acsm->acsmFailState;
     ACSM_PATTERN2 ** MatchList = acsm->acsmMatchList;
     ACSM_PATTERN2  * mlist,* px;
+    bool *queue_array;
 
     /* Init a Queue */
     queue_init (queue);
+    queue_array = (bool *) calloc( acsm->acsmNumStates, sizeof (bool));
 
 
     /* Add the state 0 transitions 1st, the states at depth 1, fail to state 0 */
@@ -892,7 +938,11 @@ Build_NFA (ACSM_STRUCT2 * acsm)
       s = List_GetNextState2(acsm,0,i);
       if( s )
       {
-          queue_add (queue, s);
+          if (!queue_array[s])
+          {
+              queue_add(queue, s);
+              queue_array[s] = true;
+          }
           FailState[s] = 0;
       }
     }
@@ -901,7 +951,7 @@ Build_NFA (ACSM_STRUCT2 * acsm)
     while (queue_count (queue) > 0)
     {
         r = queue_remove (queue);
-
+        queue_array[r] = false;
         /* Find Final States for any Failure */
         for (i = 0; i < acsm->acsmAlphabetSize; i++)
         {
@@ -911,7 +961,11 @@ Build_NFA (ACSM_STRUCT2 * acsm)
 
            if( (acstate_t)s != ACSM_FAIL_STATE2 )
            {
-                queue_add (queue, s);
+                if (!queue_array[s])
+                {
+                    queue_add(queue, s);
+                    queue_array[s] = true;
+                }
 
                 fs = FailState[r];
 
@@ -950,7 +1004,7 @@ Build_NFA (ACSM_STRUCT2 * acsm)
 
     /* Clean up the queue */
     queue_free (queue);
-
+    free(queue_array);
     if( s_verbose)printf("End Build_NFA: NumStates=%d\n",acsm->acsmNumStates);
 }
 
@@ -963,17 +1017,38 @@ Convert_NFA_To_DFA (ACSM_STRUCT2 * acsm)
     int i, r, s, cFailState;
     QUEUE  q, *queue = &q;
     acstate_t * FailState = acsm->acsmFailState;
+    trans_node_t **acsmTransTableOpt;
+    bool *queue_array;
 
     /* Init a Queue */
     queue_init (queue);
+    queue_array = (bool*) calloc( acsm->acsmNumStates, sizeof (bool));
+    acsmTransTableOpt = (trans_node_t**)
+        calloc(acsm->acsmAlphabetSize * acsm->acsmNumStates, sizeof(trans_node_t*));
+
+    for(i=0; i<acsm->acsmNumStates; i++)
+    {
+        trans_node_t * t = acsm->acsmTransTable[i];
+
+        while( t )
+        {
+            int index = i * acsm->acsmAlphabetSize + t->key;
+            acsmTransTableOpt[index] = t;
+            t=t->next;
+        }
+    }
 
     /* Add the state 0 transitions 1st */
     for(i=0; i<acsm->acsmAlphabetSize; i++)
     {
-      s = List_GetNextState(acsm,0,i);
+      s = List_GetNextStateOpt(acsm, acsmTransTableOpt, 0, i);
       if ( s != 0 )
       {
-          queue_add (queue, s);
+          if (!queue_array[s])
+          {
+              queue_add (queue, s);
+              queue_array[s] = true;
+          }
       }
     }
 
@@ -981,23 +1056,26 @@ Convert_NFA_To_DFA (ACSM_STRUCT2 * acsm)
     while( queue_count(queue) > 0 )
     {
         r = queue_remove(queue);
-
+        queue_array[r] = false;
         /* Process this states layer */
         for (i = 0; i < acsm->acsmAlphabetSize; i++)
         {
-          s = List_GetNextState(acsm,r,i);
+          s = List_GetNextStateOpt(acsm, acsmTransTableOpt, r, i);
 
           if( (acstate_t)s != ACSM_FAIL_STATE2 && s!= 0)
           {
-              queue_add (queue, s);
+              if (!queue_array[s])
+              {
+                  queue_add(queue, s);
+                  queue_array[s] = true;
+              }
           }
           else
           {
-              cFailState = List_GetNextState(acsm,FailState[r],i);
-
+              cFailState = List_GetNextStateOpt(acsm, acsmTransTableOpt,FailState[r],i);
               if( cFailState != 0 && (acstate_t)cFailState != ACSM_FAIL_STATE2 )
               {
-                  List_PutNextState(acsm,r,i,cFailState);
+                  List_PutNextStateOpt(acsm,acsmTransTableOpt,r,i,cFailState);
               }
           }
         }
@@ -1006,6 +1084,9 @@ Convert_NFA_To_DFA (ACSM_STRUCT2 * acsm)
     /* Clean up the queue */
     queue_free (queue);
 
+    free(acsmTransTableOpt);
+    free(queue_array);
+    
     if(s_verbose)printf("End Convert_NFA_To_DFA: NumStates=%d\n",acsm->acsmNumStates);
 
 }
@@ -1096,6 +1177,7 @@ Conv_Full_DFA_To_Sparse(ACSM_STRUCT2 * acsm)
   {
     cnt=0;
 
+    memset(full, 0, acsm->sizeofstate * acsm->acsmAlphabetSize);
     List_ConvToFull(acsm, (acstate_t)k, full );
 
     for (i = 0; i < acsm->acsmAlphabetSize; i++)
@@ -1165,6 +1247,7 @@ Conv_Full_DFA_To_Banded(ACSM_STRUCT2 * acsm)
   {
     cnt=0;
 
+    memset(full, 0, acsm->sizeofstate * acsm->acsmAlphabetSize);
     List_ConvToFull(acsm, (acstate_t)k, full );
 
     first=-1;
@@ -1286,6 +1369,7 @@ Conv_Full_DFA_To_SparseBands(ACSM_STRUCT2 * acsm)
   {
     cnt=0;
 
+    memset(full, 0, acsm->sizeofstate * acsm->acsmAlphabetSize);
     List_ConvToFull(acsm, (acstate_t)k, full );
 
     nbands = calcSparseBands( full, band_begin, band_end, acsm->acsmAlphabetSize, zcnt );
@@ -2603,6 +2687,116 @@ acsmSearchSparseDFA_Full_q(
 }
 
 /*
+ *  Matching states are queued, duplicate matches are dropped,
+ *  and after the complete buffer scan, the queued matches are
+ *  processed.  This improves cacheing performance, and reduces
+ *  duplicate rule processing. The queue is limited in size and
+ *  is flushed if it becomes full during the scan.  This allows
+ *  simple insertions. Tracking queue ops is optional, as this can
+ *  impose a modest performance hit of a few percent.
+ */
+#define AC_SEARCH_Q_ALL \
+    for (; T < Tend; T++) \
+    { \
+        ps = NextState[state]; \
+        sindex = xlatcase[T[0]]; \
+        if (ps[1]) \
+        { \
+            for( mlist = MatchList[state]; \
+                 mlist!= NULL; \
+                 mlist = mlist->next ) \
+            { \
+                if( mlist->nocase || (memcmp (mlist->casepatrn, T - mlist->n, mlist->n ) == 0)) \
+                { \
+                    if (_add_queue(&acsm->q,mlist)) \
+                    { \
+                        if (_process_queue(&acsm->q, Match,data)) \
+                        { \
+                            *current_state = state; \
+                            return 1; \
+                        } \
+                    } \
+                } \
+            } \
+        } \
+        state = ps[2 + sindex]; \
+    }
+
+static inline int
+acsmSearchSparseDFA_Full_q_all(
+        ACSM_STRUCT2 *acsm,
+        const unsigned char *T,
+        int n,
+        int (*Match)(void * id, void *tree, int index, void *data, void *neg_list),
+        void *data,
+        int *current_state
+        )
+{
+    const unsigned char *Tend;
+    int sindex;
+    acstate_t state;
+    ACSM_PATTERN2 **MatchList = acsm->acsmMatchList;
+    ACSM_PATTERN2 *mlist;
+
+    Tend = T + n;
+
+    if (current_state == NULL)
+        return 0;
+
+    _init_queue(&acsm->q);
+
+    state = *current_state;
+
+    switch (acsm->sizeofstate)
+    {
+        case 1:
+            {
+                uint8_t *ps;
+                uint8_t **NextState = (uint8_t **)acsm->acsmNextState;
+                AC_SEARCH_Q_ALL;
+            }
+            break;
+        case 2:
+            {
+                uint16_t *ps;
+                uint16_t **NextState = (uint16_t **)acsm->acsmNextState;
+                AC_SEARCH_Q_ALL;
+            }
+            break;
+        default:
+            {
+                acstate_t *ps;
+                acstate_t **NextState = acsm->acsmNextState;
+                AC_SEARCH_Q_ALL;
+            }
+            break;
+    }
+
+    *current_state = state;
+
+    for( mlist = MatchList[state];
+         mlist!= NULL;
+         mlist = mlist->next )
+    {
+        if( mlist->nocase || (memcmp (mlist->casepatrn, T - mlist->n, mlist->n ) == 0))
+        {
+            if (_add_queue(&acsm->q,mlist))
+            {
+                if (_process_queue(&acsm->q, Match,data))
+                {
+                    *current_state = state;
+                    return 1;
+                }
+            }
+        }
+    }
+
+    _process_queue(&acsm->q,Match,data);
+
+    return 0;
+}
+
+/*
 *   Full format DFA search
 *   Do not change anything here without testing, caching and prefetching
 *   performance is very sensitive to any changes.
@@ -2698,6 +2892,117 @@ acsmSearchSparseDFA_Full(
             return nfound;
         }
     }
+
+    *current_state = state;
+    return nfound;
+}
+
+/*
+*   Full format DFA search
+*   Do not change anything here without testing, caching and prefetching
+*   performance is very sensitive to any changes.
+*
+*   Perf-Notes:
+*    1) replaced ConvertCaseEx with inline xlatcase - this improves performance 5-10%
+*    2) using 'nocase' improves performance again by 10-15%, since memcmp is not needed
+*    3)
+*/
+#define AC_SEARCH_ALL \
+    for( ; T < Tend; T++ ) \
+    { \
+        ps = NextState[ state ]; \
+        sindex = xlatcase[T[0]]; \
+        if (ps[1]) \
+        { \
+            for( mlist = MatchList[state]; \
+                 mlist!= NULL; \
+                 mlist = mlist->next ) \
+            { \
+                index = T - mlist->n - Tx; \
+                if( mlist->nocase || (memcmp (mlist->casepatrn, Tx + index, mlist->n ) == 0)) \
+                { \
+                    nfound++; \
+                    if (Match (mlist->udata, mlist->rule_option_tree, index, data, mlist->neg_list) > 0) \
+                    { \
+                        *current_state = state; \
+                        return nfound; \
+                    } \
+                } \
+            } \
+        } \
+        state = ps[2u + sindex]; \
+    }
+
+static inline int
+acsmSearchSparseDFA_Full_All(
+        ACSM_STRUCT2 *acsm,
+        const unsigned char *Tx,
+        int n,
+        int (*Match)(void * id, void *tree, int index, void *data, void *neg_list),
+        void *data,
+        int *current_state
+        )
+{
+    ACSM_PATTERN2 *mlist;
+    const unsigned char   * Tend;
+    const unsigned char   * T;
+    int index;
+    int sindex;
+    int nfound = 0;
+    acstate_t state;
+    ACSM_PATTERN2 **MatchList = acsm->acsmMatchList;
+
+    T = Tx;
+    Tend = Tx + n;
+
+    if (current_state == NULL)
+        return 0;
+
+    state = *current_state;
+
+    switch (acsm->sizeofstate)
+    {
+        case 1:
+            {
+                uint8_t *ps;
+                uint8_t **NextState = (uint8_t **)acsm->acsmNextState;
+                AC_SEARCH_ALL;
+            }
+            break;
+        case 2:
+            {
+                uint16_t *ps;
+                uint16_t **NextState = (uint16_t **)acsm->acsmNextState;
+                AC_SEARCH_ALL;
+            }
+            break;
+        default:
+            {
+                acstate_t *ps;
+                acstate_t **NextState = acsm->acsmNextState;
+                AC_SEARCH_ALL;
+            }
+            break;
+    }
+
+    /* Check the last state for a pattern match */
+    for( mlist = MatchList[state];
+         mlist!= NULL;
+         mlist = mlist->next )
+    {
+        index = T - mlist->n - Tx;
+
+        if( mlist->nocase || (memcmp (mlist->casepatrn, Tx + index, mlist->n) == 0))
+        {
+            nfound++;
+            if (Match(mlist->udata, mlist->rule_option_tree, index, data, mlist->neg_list) > 0)
+            {
+                *current_state = state;
+                return nfound;
+            }
+        }
+    }
+
 
     *current_state = state;
     return nfound;
@@ -2867,6 +3172,51 @@ acsmSearch2(ACSM_STRUCT2 * acsm, unsigned char *Tx, int n,
         else if( acsm->acsmFormat == ACF_FULLQ )
         {
             return acsmSearchSparseDFA_Full_q( acsm, Tx, n, Match, data,
+                    current_state );
+        }
+        else if( acsm->acsmFormat == ACF_BANDED )
+        {
+            return acsmSearchSparseDFA_Banded( acsm, Tx, n, Match, data,
+                    current_state );
+        }
+        else
+        {
+            return acsmSearchSparseDFA( acsm, Tx, n, Match, data,
+                    current_state );
+        }
+
+        case FSA_NFA:
+
+            return acsmSearchSparseNFA( acsm, Tx, n, Match, data,
+                    current_state );
+
+        case FSA_TRIE:
+
+            return 0;
+    }
+    return 0;
+}
+/*
+*   Search Function
+*/
+int
+acsmSearchAll2(ACSM_STRUCT2 * acsm, unsigned char *Tx, int n,
+           int (*Match)(void * id, void *tree, int index, void *data, void *neg_list),
+           void *data, int* current_state )
+{
+
+    switch( acsm->acsmFSA )
+    {
+        case FSA_DFA:
+
+        if( acsm->acsmFormat == ACF_FULL )
+        {
+            return acsmSearchSparseDFA_Full_All( acsm, Tx, n, Match, data,
+                    current_state );
+        }
+        else if( acsm->acsmFormat == ACF_FULLQ )
+        {
+            return acsmSearchSparseDFA_Full_q_all( acsm, Tx, n, Match, data,
                     current_state );
         }
         else if( acsm->acsmFormat == ACF_BANDED )

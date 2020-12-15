@@ -1,5 +1,5 @@
 /*
- ** Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+ ** Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
  ** Copyright (C) 2002-2013 Sourcefire, Inc.
  ** Copyright (C) 1998-2002 Martin Roesch <roesch@sourcefire.com>
  **
@@ -46,6 +46,7 @@ HttpBuffer http_buffer[HTTP_BUFFER_MAX];
 DataPointer DetectBuffer;
 DataPointer file_data_ptr;
 DataBuffer DecodeBuffer;
+void *global_ssl_callback = NULL;
 
 const char* http_buffer_name[HTTP_BUFFER_MAX] =
 {
@@ -56,15 +57,14 @@ const char* http_buffer_name[HTTP_BUFFER_MAX] =
     "http_method",
     "http_cookie",
     "http_stat_code",
-    "http_stat_msg"
+    "http_stat_msg",
     "http_raw_uri",
     "http_raw_header",
     "http_raw_cookie",
 };
 
 static const char* rule_type[RULE_TYPE__MAX] = {
-    "none", "activate", "alert", "drop", "dynamic",
-    "log", "pass", "reject", "sdrop"
+    "none", "alert", "drop", "log", "pass", "reject", "sdrop"
 };
 
 #define LOG_CHARS 16
@@ -115,7 +115,7 @@ void EventTrace_Log (const Packet* p, OptTreeNode* otn, int action)
 
     TextLog_Print(tlog,
         "\nEvt=%u, Gid=%u, Sid=%u, Rev=%u, Act=%s\n",
-        event_id, otn->sigInfo.generator, 
+        event_id, otn->sigInfo.generator,
         otn->sigInfo.id, otn->sigInfo.rev, acts
     );
     TextLog_Print(tlog,
@@ -124,9 +124,9 @@ void EventTrace_Log (const Packet* p, OptTreeNode* otn, int action)
         p->pkth->pktlen, p->pkth->caplen
     );
     TextLog_Print(tlog,
-        "Pkt Bits: Flags=0x%X, PP=0x%X, PPR=0x%X, Proto=0x%X"
+        "Pkt Bits: Flags=0x%X, PP=0x%llx, Proto=0x%X"
         ", Err=0x%X\n",
-        p->packet_flags, p->preprocessor_bits, p->preproc_reassembly_pkt_bits,
+        p->packet_flags, p->preprocessor_bits,
         (unsigned)p->proto_bits, (unsigned)p->error_flags
     );
     TextLog_Print(tlog,

@@ -1,6 +1,6 @@
 /* $Id$ */
 /*
-** Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+** Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
 ** Copyright (C) 2002-2013 Sourcefire, Inc.
 ** Copyright (C) 2002 Martin Roesch <roesch@sourcefire.com>
 **
@@ -66,9 +66,7 @@ static struct mallinfo mi;
 #include <strings.h>
 #endif
 
-#ifdef ZLIB
 #include <zlib.h>
-#endif
 
 #include "snort.h"
 #include "mstring.h"
@@ -85,6 +83,7 @@ static struct mallinfo mi;
 #include "ppm.h"
 #include "active.h"
 #include "packet_time.h"
+#include "control/sfcontrol.h"
 
 #ifdef TARGET_BASED
 #include "sftarget_reader.h"
@@ -98,7 +97,7 @@ static struct mallinfo mi;
 #include "win32/WIN32-Code/name.h"
 #endif
 
-#include "stream5_common.h"
+#include "stream_common.h"
 
 #ifdef PATH_MAX
 #define PATH_MAX_UTIL PATH_MAX
@@ -176,9 +175,7 @@ int DisplayBanner(void)
 {
     const char * info;
     const char * pcre_ver;
-#ifdef ZLIB
     const char * zlib_ver;
-#endif
 
     info = getenv("HOSTTYPE");
     if( !info )
@@ -187,9 +184,7 @@ int DisplayBanner(void)
     }
 
     pcre_ver = pcre_version();
-#ifdef ZLIB
     zlib_ver = zlib_version;
-#endif
 
     LogMessage("\n");
     LogMessage("   ,,_     -*> Snort! <*-\n");
@@ -202,16 +197,14 @@ int DisplayBanner(void)
 #endif
                BUILD,
                info);
-    LogMessage("   ''''    By Martin Roesch & The Snort Team: http://www.snort.org/snort/snort-team\n");
-    LogMessage("           Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.\n");
+    LogMessage("   ''''    By Martin Roesch & The Snort Team: http://www.snort.org/contact#team\n");
+    LogMessage("           Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.\n");
     LogMessage("           Copyright (C) 1998-2013 Sourcefire, Inc., et al.\n");
 #ifdef HAVE_PCAP_LIB_VERSION
     LogMessage("           Using %s\n", pcap_lib_version());
 #endif
     LogMessage("           Using PCRE version: %s\n", pcre_ver);
-#ifdef ZLIB
     LogMessage("           Using ZLIB version: %s\n", zlib_ver);
-#endif
     LogMessage("\n");
 
     return 0;
@@ -264,11 +257,20 @@ void ts_print(register const struct timeval *tvp, char *timebuf)
 
     lt = gmtime(&Time);
 
+    if(!lt)
+    {
+         /* Invalid time, set to 0*/
+         s = 0;
+         Time = 0;
+         lt = gmtime(&Time);
+    }
+
     if (ScOutputIncludeYear())
     {
+        int year = (lt->tm_year >= 100) ? (lt->tm_year - 100) : lt->tm_year;
         (void) SnortSnprintf(timebuf, TIMEBUF_SIZE,
                         "%02d/%02d/%02d-%02d:%02d:%02d.%06u ",
-                        lt->tm_mon + 1, lt->tm_mday, lt->tm_year - 100,
+                        lt->tm_mon + 1, lt->tm_mday, year,
                         s / 3600, (s % 3600) / 60, s % 60,
                         (u_int) tvp->tv_usec);
     }
@@ -482,6 +484,9 @@ void ErrorMessageThrottled(ThrottleInfo *throttleInfo, const char *format,...)
     if ((snort_conf == NULL)||(!throttleInfo))
         return;
 
+    if (!ScCheckInternalLogLevel(INTERNAL_LOG_LEVEL__ERROR))
+        return;
+
     throttleInfo->count++;
     DEBUG_WRAP(DebugMessage(DEBUG_INIT,"current_time: %d, throttle (%p): count "STDu64", last update: %d\n",
             (int)current_time, throttleInfo, throttleInfo->count, (int)throttleInfo->lastUpdate );)
@@ -509,6 +514,57 @@ void ErrorMessageThrottled(ThrottleInfo *throttleInfo, const char *format,...)
 
 }
 
+/*
+ * Function: LogThrottledByTimeCount(ThrottleInfo *,const char *, ...)
+ *   
+ * Purpose: Print a message based on time and count of messages.
+ *      
+ * Arguments: throttleInfo => point to the saved throttle state information
+ *            format => the formatted message string to print out
+ *            ... => format commands/fillers
+ *          
+ * Returns: void function
+ */            
+void LogThrottledByTimeCount(ThrottleInfo *throttleInfo, const char *format,...)
+{
+    char buf[STD_BUF+1];
+    va_list ap;
+    time_t current_time = packet_time();
+
+    if ((!snort_conf) || (!throttleInfo))
+        return;
+
+    if (!ScCheckInternalLogLevel(INTERNAL_LOG_LEVEL__ERROR))
+        return;
+
+    throttleInfo->count++;
+    DEBUG_WRAP(DebugMessage(DEBUG_INIT,"current_time: %d, throttle (%p): count "STDu64", last update: %d\n",
+                (int)current_time, throttleInfo, throttleInfo->count, (int)throttleInfo->lastUpdate );)
+
+    if ((throttleInfo->lastUpdate == 0)
+           || ((current_time - (time_t)throttleInfo->duration_to_log > throttleInfo->lastUpdate)
+           && ((throttleInfo->count == 1)
+           || throttleInfo->count > throttleInfo->count_to_log)))
+    {
+       int index;
+       va_start(ap, format);
+       index = vsnprintf(buf, STD_BUF, format, ap);
+       va_end(ap);
+
+       if (index) 
+       {
+           snprintf(&buf[index - 1], STD_BUF-index,
+               " (suppressed "STDu64" times in the last %d seconds).\n",
+               throttleInfo->count, throttleInfo->lastUpdate
+               ? ((int)(current_time - throttleInfo->lastUpdate))
+               : ((int)throttleInfo->lastUpdate));
+       }
+
+       LogMessage("%s",buf);
+       throttleInfo->lastUpdate = current_time;
+       throttleInfo->count = 0;
+    }
+}
 
 /*
  * Function: LogMessage(const char *, ...)
@@ -528,7 +584,7 @@ void LogMessage(const char *format,...)
     if (snort_conf == NULL)
         return;
 
-    if (ScLogQuiet() && !ScDaemonMode() && !ScLogSyslog())
+    if (!ScCheckInternalLogLevel(INTERNAL_LOG_LEVEL__MESSAGE))
         return;
 
     va_start(ap, format);
@@ -565,7 +621,7 @@ void WarningMessage(const char *format,...)
     if (snort_conf == NULL)
         return;
 
-    if (ScLogQuiet() && !ScDaemonMode() && !ScLogSyslog())
+    if (!ScCheckInternalLogLevel(INTERNAL_LOG_LEVEL__WARNING))
         return;
 
     va_start(ap, format);
@@ -711,6 +767,15 @@ NORETURN void FatalError(const char *format,...)
 
     if ( InMainThread() || SnortIsInitializing() )
     {
+        if (!SnortIsInitializing()) 
+        {
+            /*
+             * Shutdown the thread only when the snort is not 
+             * initializing. Because FatalError api can be 
+             * called during initialization as well.
+             */
+            SnortShutdownThreads(1);
+        }
         DAQ_Abort();
         exit(1);
     }
@@ -737,6 +802,7 @@ NORETURN void FatalError(const char *format,...)
  ****************************************************************************/
 static FILE *pid_lockfile = NULL;
 static FILE *pid_file = NULL;
+
 void CreatePidFile(const char *intf, pid_t pid)
 {
     struct stat pt;
@@ -788,16 +854,14 @@ void CreatePidFile(const char *intf, pid_t pid)
                        "system\n", _PATH_VARRUN);
 #endif  /* _PATH_VARRUN */
 
-            stat(_PATH_VARRUN, &pt);
-
-            if(!S_ISDIR(pt.st_mode) || access(_PATH_VARRUN, W_OK) == -1)
+            if ((stat(_PATH_VARRUN, &pt) == -1) ||
+                !S_ISDIR(pt.st_mode) || access(_PATH_VARRUN, W_OK) == -1)
             {
                 LogMessage("WARNING: _PATH_VARRUN is invalid, trying "
                            "/var/log/ ...\n");
                 SnortStrncpy(snort_conf->pid_path, "/var/log/", sizeof(snort_conf->pid_path));
-                stat(snort_conf->pid_path, &pt);
-
-                if(!S_ISDIR(pt.st_mode) || access(snort_conf->pid_path, W_OK) == -1)
+                if ((stat(snort_conf->pid_path, &pt) == -1) ||
+                    !S_ISDIR(pt.st_mode) || access(snort_conf->pid_path, W_OK) == -1)
                 {
                     LogMessage("WARNING: %s is invalid, logging Snort "
                                "PID path to log directory (%s).\n", snort_conf->pid_path,
@@ -859,6 +923,9 @@ void CreatePidFile(const char *intf, pid_t pid)
                 ClosePidFile();
                 FatalError("Failed to Lock PID File \"%s\" for PID \"%d\"\n", snort_conf->pid_filename, (int)pid);
             }
+
+            /* Give desired user control over lock file */
+            fchown(fileno(pid_lockfile), ScUid(), ScGid());
         }
     }
 #endif
@@ -870,6 +937,11 @@ void CreatePidFile(const char *intf, pid_t pid)
         LogMessage("Writing PID \"%d\" to file \"%s\"\n", (int)pid, snort_conf->pid_filename);
         fprintf(pid_file, "%d\n", (int)pid);
         fflush(pid_file);
+        
+#ifndef WIN32
+        /* Give desired user control over pid file */
+        fchown(fileno(pid_file), ScUid(), ScGid());
+#endif
     }
     else
     {
@@ -1002,6 +1074,18 @@ void InitGroups(int user_id, int group_id)
 #define STATS_SEPARATOR \
     "==============================================================================="
 
+static inline int DisplayCount (char *buf, const char* s, uint64_t n, int size)
+{
+    return snprintf(buf+size, CS_STATS_BUF_SIZE-size, "%11s: " FMTu64("12") "\n", s, n);
+}
+
+static inline int DisplayStat (char *buf, const char* s, uint64_t n, uint64_t tot, int size)
+{
+	return snprintf(buf+size, CS_STATS_BUF_SIZE-size,
+        "%11s: " FMTu64("12") " (%7.3f%%)\n",
+        s, n, CalcPct(n, tot));
+}
+
 static inline void LogCount (const char* s, uint64_t n)
 {
     LogMessage("%11s: " FMTu64("12") "\n", s, n);
@@ -1083,7 +1167,12 @@ static const char* Verdicts[MAX_DAQ_VERDICT] = {
     "Replace",
     "Whitelist",
     "Blacklist",
+#ifdef HAVE_DAQ_VERDICT_RETRY
+    "Ignore",
+    "Retry"
+#else
     "Ignore"
+#endif
 };
 
 #ifdef HAVE_MALLINFO
@@ -1093,11 +1182,11 @@ static void display_mallinfo(void)
     LogMessage("%s\n", STATS_SEPARATOR);
     LogMessage("Memory usage summary:\n");
     LogMessage("  Total non-mmapped bytes (arena):       %d\n", mi.arena);
-    LogMessage("  Bytes in mapped regions (hblkhd):      %d\n", mi.hblkhd);    
+    LogMessage("  Bytes in mapped regions (hblkhd):      %d\n", mi.hblkhd);
     LogMessage("  Total allocated space (uordblks):      %d\n", mi.uordblks);
     LogMessage("  Total free space (fordblks):           %d\n", mi.fordblks);
     LogMessage("  Topmost releasable block (keepcost):   %d\n", mi.keepcost);
-#ifdef DEBUG    
+#ifdef DEBUG
     LogMessage("  Number of free chunks (ordblks):       %d\n", mi.ordblks);
     LogMessage("  Number of free fastbin blocks (smblks):%d\n", mi.smblks);
     LogMessage("  Number of mapped regions (hblks):      %d\n", mi.hblks);
@@ -1107,6 +1196,49 @@ static void display_mallinfo(void)
 
 }
 #endif
+
+void DisplayActionStats (uint16_t type, void *old_context, struct _THREAD_ELEMENT *te, ControlDataSendFunc f)
+{
+    char buffer[CS_STATS_BUF_SIZE + 1];
+    int len = 0;
+    int i = 0;
+    uint64_t total = pc.total_processed;
+    uint64_t pkts_recv = pc.total_from_daq;
+    const DAQ_Stats_t* pkt_stats = DAQ_GetStats();
+
+    if (total) {
+        // ensure proper counting of log_limit
+        SnortEventqResetCounts();
+
+        len += snprintf(buffer, CS_STATS_BUF_SIZE,  "Action Stats:\n");
+        len += DisplayStat(buffer, "Alerts", pc.total_alert_pkts, total, len);
+        len += DisplayStat(buffer, "Logged", pc.log_pkts, total, len);
+        len += DisplayStat(buffer, "Passed", pc.pass_pkts, total, len);
+        len += snprintf(buffer+len, CS_STATS_BUF_SIZE-len,  "Limits:\n");
+        len += DisplayCount(buffer, "Match", pc.match_limit, len);
+        len += DisplayCount(buffer, "Queue", pc.queue_limit, len);
+        len += DisplayCount(buffer, "Log", pc.log_limit, len);
+        len += DisplayCount(buffer, "Event", pc.event_limit, len);
+        len += DisplayCount(buffer, "Alert", pc.alert_limit, len);
+        len += snprintf(buffer+len, CS_STATS_BUF_SIZE-len,  "Verdicts:\n");
+
+        for ( i = 0; i < MAX_DAQ_VERDICT && len < CS_STATS_BUF_SIZE; i++ ) {
+            const char* s = Verdicts[i];
+            len += DisplayStat(buffer, s, pkt_stats->verdicts[i], pkts_recv, len);
+        }
+        if ( pc.internal_blacklist )
+            len += DisplayStat(buffer, "Int Blklst", pc.internal_blacklist, pkts_recv, len);
+
+        if ( pc.internal_whitelist )
+            len += DisplayStat(buffer, "Int Whtlst", pc.internal_whitelist, pkts_recv, len);
+    } else {
+        len = snprintf(buffer, CS_STATS_BUF_SIZE,  "Action Stats are not available\n Total Action Processed:"FMTu64("12") "\n", total);
+    }
+
+    if (-1 == f(te, (const uint8_t *)buffer, len)) {
+        LogMessage("Unable to send data to the frontend\n");
+    }
+}
 
 /* exiting should be 0 for if not exiting, 1 if restarting, and 2 if exiting */
 void DropStats(int exiting)
@@ -1227,6 +1359,13 @@ void DropStats(int exiting)
     LogStat("S5 G 1", pc.s5tcp1, total);
     LogStat("S5 G 2", pc.s5tcp2, total);
 
+    if ( InternalEventIsEnabled(snort_conf->rate_filter_config,
+                INTERNAL_EVENT_SYN_RECEIVED) )
+    {
+        LogStat("SYN RL Evnt", pc.syn_rate_limit_events, total);
+        LogStat("SYN RL Drop", pc.syn_rate_limit_drops, total);
+    }
+
     LogCount("Total", total);
 
     if ( !ScPacketDumpMode() && !ScPacketLogMode() )
@@ -1266,7 +1405,7 @@ void DropStats(int exiting)
             LogStat("Int Whtlst", pc.internal_whitelist, pkts_recv);
     }
 #ifdef TARGET_BASED
-    if (ScIdsMode() && IsAdaptiveConfigured(getDefaultPolicy()))
+    if (ScIdsMode() && IsAdaptiveConfigured())
     {
         LogMessage("%s\n", STATS_SEPARATOR);
         LogMessage("Attribute Table Stats:\n");
@@ -1543,8 +1682,8 @@ void GoDaemon(void)
     (void)open("/dev/null", O_RDWR);  /* stdin, fd 0 */
 #endif
 
-    dup(0);  /* stdout, fd 0 => fd 1 */
-    dup(0);  /* stderr, fd 0 => fd 2 */
+    if (dup(0)) {}  /* stdout, fd 0 => fd 1 */
+    if (dup(0)) {}  /* stderr, fd 0 => fd 2 */
 
     SignalWaitingParent();
 #endif /* ! WIN32 */
@@ -1979,6 +2118,9 @@ void SetChroot(char *directory, char **logstore)
 
     LogMessage("Chroot directory = %s\n", directory);
 
+    if(logdir != NULL)
+        free(logdir);
+
 #if 0
     /* XXX XXX */
     /* install the I can't do this signal handler */
@@ -2384,7 +2526,7 @@ unsigned int xatoup(const char *s , const char *etext)
     return (unsigned int)val;
 }
 
-char * ObfuscateIpToText(sfip_t *ip)
+char * ObfuscateIpToText(sfaddr_t *ip)
 {
     static char ip_buf1[INET6_ADDRSTRLEN];
     static char ip_buf2[INET6_ADDRSTRLEN];
@@ -2403,21 +2545,21 @@ char * ObfuscateIpToText(sfip_t *ip)
     if (ip == NULL)
         return ip_buf;
 
-    if (!IP_IS_SET(snort_conf->obfuscation_net))
+    if (!sfip_is_set(&snort_conf->obfuscation_net))
     {
-        if (IS_IP6(ip))
+        if (sfaddr_family(ip) == AF_INET6)
             SnortSnprintf(ip_buf, buf_size, "x:x:x:x::x:x:x:x");
         else
             SnortSnprintf(ip_buf, buf_size, "xxx.xxx.xxx.xxx");
     }
     else
     {
-        sfip_t tmp;
+        sfaddr_t tmp;
         char *tmp_buf;
 
         IP_COPY_VALUE(tmp, ip);
 
-        if (IP_IS_SET(snort_conf->homenet))
+        if (sfip_is_set(&snort_conf->homenet))
         {
             if (sfip_contains(&snort_conf->homenet, &tmp) == SFIP_CONTAINS)
                 sfip_obfuscate(&snort_conf->obfuscation_net, &tmp);

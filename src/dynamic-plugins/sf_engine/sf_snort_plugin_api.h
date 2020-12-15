@@ -16,7 +16,7 @@
  * along with this program; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
  *
- * Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+ * Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
  * Copyright (C) 2005-2013 Sourcefire, Inc.
  *
  * Author: Steve Sturges
@@ -54,12 +54,12 @@
 
 #ifdef WIN32
 # ifdef SF_SNORT_ENGINE_DLL
-#  define ENGINE_LINKAGE SO_PUBLIC
+#  define ENGINE_LINKAGE SF_SO_PUBLIC
 # else
 #  define ENGINE_LINKAGE
 # endif
 #else /* WIN32 */
-# define ENGINE_LINKAGE SO_PUBLIC
+# define ENGINE_LINKAGE SF_SO_PUBLIC
 #endif
 
 #define RULE_NOMATCH 0
@@ -75,6 +75,7 @@
 #define CONTENT_TYPE_MISMATCH -1
 #define CONTENT_TYPE_MISSING  -2
 #define CONTENT_CURSOR_ERROR  -3
+#define CONTENT_HASH_ERROR    -4
 #define CURSOR_IN_BOUNDS       1
 #define CURSOR_OUT_OF_BOUNDS   0
 
@@ -129,6 +130,12 @@
 
 #define EXTRACT_AS_BYTE           0x10000000
 #define EXTRACT_AS_STRING         0x20000000
+
+#define JUMP_FROM_END             0x40000000
+
+#define PROTECTED_CONTENT_HASH_MD5    (1)
+#define PROTECTED_CONTENT_HASH_SHA256 (2)
+#define PROTECTED_CONTENT_HASH_SHA512 (3)
 //==========================================
 
 #define CHECK_EQ            0
@@ -141,7 +148,13 @@
 #define CHECK_XOR           7
 #define CHECK_ALL           8
 #define CHECK_ATLEASTONE    9
-#define CHECK_NONE          10
+#define CHECK_ADD           10
+#define CHECK_SUB           11
+#define CHECK_MUL           12
+#define CHECK_DIV           13
+#define CHECK_LS            14
+#define CHECK_RS            15
+#define CHECK_NONE          16
 
 #define HTTP_CONTENT(cf) (cf & CONTENT_BUF_HTTP)
 
@@ -173,6 +186,21 @@ typedef struct _ContentInfo
     int32_t *offset_location;
     uint32_t *depth_location;
 } ContentInfo;
+typedef struct _ProtectedContentInfo
+{
+    const uint8_t *pattern;
+    uint32_t depth;
+    int32_t offset;
+    uint32_t flags;        /* must include a CONTENT_BUF_X */
+    uint8_t hash_type;
+    uint32_t protected_length;
+    uint8_t *patternByteForm;
+    uint32_t patternByteFormLength;
+    char *offset_refId;     /* To match up with a DynamicElement refId */
+    char *depth_refId;      /* To match up with a DynamicElement refId */
+    int32_t *offset_location;
+    uint32_t *depth_location;
+} ProtectedContentInfo;
 
 typedef struct _CursorInfo
 {
@@ -239,6 +267,9 @@ typedef struct _ByteData
     char *value_refId;      /* To match up with a DynamicElement refId */
     int32_t *offset_location;
     uint32_t *value_location;
+    uint32_t bitmask_val;
+    char *postoffset_refId;     /* To match up with a DynamicElement refId */
+    char *refId;      /* To match up with a DynamicElement refId */
 } ByteData;
 
 typedef struct _ByteExtract
@@ -250,6 +281,7 @@ typedef struct _ByteExtract
     char *refId;          /* To match up with a DynamicElement refId */
     void *memoryLocation; /* Location to store the data extracted */
     uint8_t  align;      /* Align to 2 or 4 bit boundary after extraction */
+    uint32_t bitmask_val;
 } ByteExtract;
 
 typedef struct _FlowFlags
@@ -359,6 +391,7 @@ typedef struct _RuleOption
     {
         void *ptr;
         ContentInfo *content;
+        ProtectedContentInfo *protectedContent;
         CursorInfo *cursor;
         PCREInfo *pcre;
         FlowBitsInfo *flowBit;
@@ -432,6 +465,7 @@ ENGINE_LINKAGE int RegisterRules(struct _SnortConfig *sc, Rule **rules);
 ENGINE_LINKAGE int DumpRules(char *rulesFileName, Rule **rules);
 
 ENGINE_LINKAGE int contentMatch(void *p, ContentInfo* content, const uint8_t **cursor);
+ENGINE_LINKAGE int protectedContentMatch(void *p, ProtectedContentInfo* content, const uint8_t **cursor);
 ENGINE_LINKAGE int checkFlow(void *p, FlowFlags *flowFlags);
 ENGINE_LINKAGE int extractValue(void *p, ByteExtract *byteExtract, const uint8_t *cursor);
 ENGINE_LINKAGE int processFlowbits(void *p, FlowBitsInfo *flowBits);
@@ -445,6 +479,7 @@ ENGINE_LINKAGE int checkCursor(void *p, CursorInfo *cursorInfo, const uint8_t *c
 ENGINE_LINKAGE int checkValue(void *p, ByteData *byteData, uint32_t value, const uint8_t *cursor);
 /* Same as extractValue plus checkValue */
 ENGINE_LINKAGE int byteTest(void *p, ByteData *byteData, const uint8_t *cursor);
+ENGINE_LINKAGE int byteMath(void *p, ByteData *byteData, const uint8_t *cursor);
 /* Same as extractValue plus setCursor */
 ENGINE_LINKAGE int byteJump(void *p, ByteData *byteData, const uint8_t **cursor);
 ENGINE_LINKAGE int pcreMatch(void *p, PCREInfo* pcre, const uint8_t **cursor);
@@ -459,8 +494,10 @@ ENGINE_LINKAGE int MatchDecryptedRC4(
     const uint8_t *key, uint16_t keylen, const uint8_t *encrypted_data,
     uint8_t *plain_data, uint16_t datalen
 );
-ENGINE_LINKAGE int storeRuleData(void *, void *, uint32_t, SessionDataFree);
-ENGINE_LINKAGE void *getRuleData(void *, uint32_t);
+ENGINE_LINKAGE int storeRuleData(void *packet, const RuleInformation *info,
+    void *rule_data, void *compression_data);
+ENGINE_LINKAGE void getRuleData(void *packet, const RuleInformation *info,
+    void **p_rule_data, void **p_compression_data);
 ENGINE_LINKAGE void *allocRuleData(size_t);
 ENGINE_LINKAGE void freeRuleData(void *);
 

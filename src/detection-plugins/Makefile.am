@@ -1,4 +1,5 @@
 ## $Id
+EXTRA_DIST=detection_leaf_node.c
 AUTOMAKE_OPTIONS=foreign no-dependencies
 
 noinst_LIBRARIES = libspd.a
@@ -6,12 +7,14 @@ noinst_LIBRARIES = libspd.a
 BUILT_SOURCES = sf_snort_plugin_hdropts.c \
 sf_snort_packet.h \
 sf_snort_plugin_api.h \
-sf_decompression.h
+sf_decompression.h \
+sf_decompression_define.h
 
 nodist_libspd_a_SOURCES = sf_snort_plugin_hdropts.c \
 sf_snort_packet.h \
 sf_snort_plugin_api.h \
-sf_decompression.h
+sf_decompression.h \
+sf_decompression_define.h
 
 libspd_a_SOURCES = \
 detection_options.c detection_options.h \
@@ -20,6 +23,7 @@ sp_asn1_detect.c sp_asn1_detect.h \
 sp_byte_check.c sp_byte_check.h \
 sp_byte_jump.c sp_byte_jump.h \
 sp_byte_extract.c sp_byte_extract.h \
+sp_byte_math.c sp_byte_math.h \
 sp_clientserver.c sp_clientserver.h \
 sp_cvs.c sp_cvs.h \
 sp_dsize_check.c sp_dsize_check.h \
@@ -51,7 +55,8 @@ sp_urilen_check.c sp_urilen_check.h \
 sp_file_data.c sp_file_data.h \
 sp_base64_decode.c sp_base64_decode.h \
 sp_base64_data.c sp_base64_data.h \
-sp_pkt_data.c sp_pkt_data.h
+sp_pkt_data.c sp_pkt_data.h \
+sp_file_type.c sp_file_type.h
 
 if BUILD_REACT
 libspd_a_SOURCES += sp_react.c sp_react.h
@@ -61,10 +66,9 @@ if BUILD_RESPOND3
 libspd_a_SOURCES += sp_respond3.c sp_respond.h
 endif
 
-if FEAT_FILE_INSPECT
-libspd_a_SOURCES += sp_file_type.c sp_file_type.h
+if FEAT_OPEN_APPID
+libspd_a_SOURCES += sp_appid.c sp_appid.h 
 endif
-
 copy_files = \
 	if test -f $$dst_file; then \
 		x=`diff $$src_file $$dst_file >> /dev/null`; \
@@ -110,10 +114,13 @@ sf_snort_plugin_api.h: ../dynamic-plugins/sf_engine/sf_snort_plugin_api.h
 sf_decompression.h: ../dynamic-plugins/sf_engine/sf_decompression.h
 	@src_file=$?; dst_file=$@; $(copy_files)
 
+sf_decompression_define.h: ../dynamic-plugins/sf_decompression_define.h
+	@src_file=$?; dst_file=$@; $(copy_files)
+
 sf_snort_packet.h: ../dynamic-plugins/sf_engine/sf_snort_packet.h
 	@src_file=$?; dst_file=$@; $(copy_files)
 
 clean-local:
-	rm -rf sf_snort_plugin_hdropts.c sf_snort_packet.h sf_snort_plugin_api.h sf_decompression.h
+	rm -rf sf_snort_plugin_hdropts.c sf_snort_packet.h sf_snort_plugin_api.h sf_decompression.h sf_decompression_define.h
 
 INCLUDES = @INCLUDES@

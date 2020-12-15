@@ -1,6 +1,6 @@
 /****************************************************************************
  *
- * Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+ * Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
  * Copyright (C) 2011-2013 Sourcefire, Inc.
  *
  * This program is free software; you can redistribute it and/or modify
@@ -33,6 +33,9 @@
 #include "includes/smb.h"
 
 #define DCE2_SMB_PAF_SHIFT(x64, x8) { x64 <<= 8; x64 |= (uint64_t)x8; }
+
+static uint8_t dce2_smbpaf_id = 0;
+static uint8_t dce2_tcppaf_id = 0;
 
 // Enumerations for PAF states
 typedef enum _DCE2_PafSmbStates
@@ -84,10 +87,10 @@ typedef struct _DCE2_PafTcpState
 
 
 // Local function prototypes
-static inline bool DCE2_PafSmbIsValidNetbiosHdr(uint32_t, bool);
-static inline bool DCE2_PafAbort(void *, uint32_t);
-static PAF_Status DCE2_SmbPaf(void *, void **, const uint8_t *, uint32_t, uint32_t, uint32_t *);
-static PAF_Status DCE2_TcpPaf(void *, void **, const uint8_t *, uint32_t, uint32_t, uint32_t *);
+static inline bool DCE2_PafSmbIsValidNetbiosHdr(uint32_t, bool, SmbNtHdr *, uint32_t *);
+static inline bool DCE2_PafAbort(void *, uint64_t);
+static PAF_Status DCE2_SmbPaf(void *, void **, const uint8_t *, uint32_t, uint64_t *, uint32_t *, uint32_t *);
+static PAF_Status DCE2_TcpPaf(void *, void **, const uint8_t *, uint32_t, uint64_t *, uint32_t *, uint32_t *);
 
 
 /*********************************************************************
@@ -105,24 +108,11 @@ static PAF_Status DCE2_TcpPaf(void *, void **, const uint8_t *, uint32_t, uint32
  *  bool - true if we should abort PAF, false if not.
  *
  *********************************************************************/
-static inline bool DCE2_PafAbort(void *ssn, uint32_t flags)
+static inline bool DCE2_PafAbort(void *ssn, uint64_t flags)
 {
     DCE2_SsnData *sd;
 
-    if (_dpd.streamAPI->get_session_flags(ssn) & SSNFLAG_MIDSTREAM)
-    {
-        DEBUG_WRAP(DCE2_DebugMsg(DCE2_DEBUG__PAF,
-                    "Aborting PAF because of midstream pickup.\n"));
-        return true;
-    }
-    else if (!(_dpd.streamAPI->get_session_flags(ssn) & SSNFLAG_ESTABLISHED))
-    {
-        DEBUG_WRAP(DCE2_DebugMsg(DCE2_DEBUG__PAF,
-                    "Aborting PAF because of unestablished session.\n"));
-        return true;
-    }
-
-    sd = (DCE2_SsnData *)_dpd.streamAPI->get_application_data(ssn, PP_DCE2);
+    sd = (DCE2_SsnData *)_dpd.sessionAPI->get_application_data(ssn, PP_DCE2);
     if ((sd != NULL) && DCE2_SsnNoInspect(sd))
     {
         DEBUG_WRAP(DCE2_DebugMsg(DCE2_DEBUG__PAF, "Aborting PAF because of session data check.\n"));
@@ -141,15 +131,19 @@ static inline bool DCE2_PafAbort(void *ssn, uint32_t flags)
  * Arguments:
  *  uint32_t - the 4 bytes of the NetBIOS header
  *  bool - whether we're in a junk data state or not
+ *  SmbNtHdr * - Pointer to SMB header protocol identifier
+ *  uint32_t * - output parameter - Length in the NetBIOS header
  *
  * Returns:
  *  bool - true if valid, false if not
  *
  *********************************************************************/
-static inline bool DCE2_PafSmbIsValidNetbiosHdr(uint32_t nb_hdr, bool junk)
+static inline bool DCE2_PafSmbIsValidNetbiosHdr(uint32_t nb_hdr, bool junk, SmbNtHdr *nt_hdr, uint32_t *nb_len)
 {
     uint8_t type = (uint8_t)(nb_hdr >> 24);
     uint8_t bit = (uint8_t)((nb_hdr & 0x00ff0000) >> 16);
+    bool is_smb1 = ( SmbId(nt_hdr) == DCE2_SMB2_ID ) ? false : true;
+    uint32_t nbs_hdr = 0;
 
     if (junk)
     {
@@ -172,8 +166,19 @@ static inline bool DCE2_PafSmbIsValidNetbiosHdr(uint32_t nb_hdr, bool junk)
         }
     }
 
-    if ((bit != 0x00) && (bit != 0x01))
-        return false;
+    /*The bit should be checked only for SMB1, because the length in NetBIOS header should not exceed 0x1FFFF. See [MS-SMB] 2.1 Transport
+     * There is no such limit for SMB2 or SMB3 */
+    if(is_smb1)
+    {
+        if ((bit != 0x00) && (bit != 0x01))
+            return false;
+    }
+
+    nbs_hdr = htonl(nb_hdr);
+    if(is_smb1)
+        *nb_len = NbssLen((const NbssHdr *)&nbs_hdr);
+    else
+        *nb_len = NbssLen2((const NbssHdr *)&nbs_hdr);
 
     return true;
 }
@@ -199,33 +204,34 @@ static inline bool DCE2_PafSmbIsValidNetbiosHdr(uint32_t nb_hdr, bool junk)
  *  uint32_t - length of payload data
  *  uint32_t - flags to check whether client or server
  *  uint32_t * - pointer to set flush point
+ *  uint32_t * - pointer to set header flush point
  *
  * Returns:
  *  PAF_Status - PAF_FLUSH if flush point found, PAF_SEARCH otherwise
  *
  *********************************************************************/
 PAF_Status DCE2_SmbPaf(void *ssn, void **user, const uint8_t *data,
-        uint32_t len, uint32_t flags, uint32_t *fp)
+        uint32_t len, uint64_t *flags, uint32_t *fp, uint32_t *fp_eoh)
 {
     DCE2_PafSmbState *ss = *(DCE2_PafSmbState **)user;
     uint32_t n = 0;
     PAF_Status ps = PAF_SEARCH;
-    uint32_t nb_hdr;
-    uint32_t nb_len;
+    uint32_t nb_len = 0;
+    SmbNtHdr *nt_hdr = NULL;
 
     DEBUG_WRAP(DCE2_DebugMsg(DCE2_DEBUG__PAF, "%s\n", DCE2_DEBUG__PAF_START_MSG));
     DEBUG_WRAP(DCE2_DebugMsg(DCE2_DEBUG__PAF, "SMB: %u bytes of data\n", len));
 
 #ifdef DEBUG_MSGS
     DCE2_DEBUG_CODE(DCE2_DEBUG__PAF, printf("Session pointer: %p\n",
-                _dpd.streamAPI->get_application_data(ssn, PP_DCE2));)
-    if (flags & FLAG_FROM_CLIENT)
+                _dpd.sessionAPI->get_application_data(ssn, PP_DCE2));)
+    if (*flags & FLAG_FROM_CLIENT)
         DEBUG_WRAP(DCE2_DebugMsg(DCE2_DEBUG__PAF, "Packet from Client\n"));
     else
         DEBUG_WRAP(DCE2_DebugMsg(DCE2_DEBUG__PAF, "Packet from Server\n"));
 #endif
 
-    if (DCE2_PafAbort(ssn, flags))
+    if (DCE2_PafAbort(ssn, *flags))
     {
         DEBUG_WRAP(DCE2_DebugMsg(DCE2_DEBUG__PAF, "%s\n", DCE2_DEBUG__PAF_END_MSG));
         return PAF_ABORT;
@@ -267,10 +273,11 @@ PAF_Status DCE2_SmbPaf(void *ssn, void **user, const uint8_t *data,
                 break;
             case DCE2_PAF_SMB_STATES__3:
                 DCE2_SMB_PAF_SHIFT(ss->nb_hdr, data[n]);
-                if (DCE2_PafSmbIsValidNetbiosHdr((uint32_t)ss->nb_hdr, false))
+                /*(data + n + 1) points to the SMB header protocol identifier (0xFF,'SMB' or 0xFE,'SMB'), which follows the NetBIOS header*/
+                nt_hdr = (SmbNtHdr *)(data + n + 1);
+
+                if (DCE2_PafSmbIsValidNetbiosHdr((uint32_t)ss->nb_hdr, false, nt_hdr, &nb_len))
                 {
-                    nb_hdr = htonl((uint32_t)ss->nb_hdr);
-                    nb_len = NbssLen((const NbssHdr *)&nb_hdr);
                     *fp = (nb_len + sizeof(NbssHdr) + n) - ss->state;
                     ss->state = DCE2_PAF_SMB_STATES__0;
                     DEBUG_WRAP(DCE2_DebugMsg(DCE2_DEBUG__PAF,
@@ -285,7 +292,11 @@ PAF_Status DCE2_SmbPaf(void *ssn, void **user, const uint8_t *data,
             case DCE2_PAF_SMB_STATES__7:
                 DCE2_SMB_PAF_SHIFT(ss->nb_hdr, data[n]);
 
-                if (!DCE2_PafSmbIsValidNetbiosHdr((uint32_t)(ss->nb_hdr >> 32), true))
+                /*(data + n - sizeof(DCE2_SMB_ID) + 1) points to the smb_idf field in SmbNtHdr (0xFF,'SMB' or 0xFE,'SMB'), which follows the NetBIOS header*/
+                nt_hdr = (SmbNtHdr *)(data + n - sizeof(DCE2_SMB_ID) + 1);
+
+                /*ss->nb_hdr is the value to 4 bytes of NetBIOS header + 4 bytes of SMB header protocol identifier . Right shift by 32 bits to get the value of NetBIOS header*/
+                if (!DCE2_PafSmbIsValidNetbiosHdr((uint32_t)(ss->nb_hdr >> 32), true, nt_hdr, &nb_len))
                 {
                     DEBUG_WRAP(DCE2_DebugMsg(DCE2_DEBUG__PAF, "Invalid NetBIOS header - "
                                              "staying in State 7.\n"));
@@ -299,8 +310,6 @@ PAF_Status DCE2_SmbPaf(void *ssn, void **user, const uint8_t *data,
                     break;
                 }
 
-                nb_hdr = htonl((uint32_t)(ss->nb_hdr >> 32));
-                nb_len = NbssLen((const NbssHdr *)&nb_hdr);
                 *fp = (nb_len + sizeof(NbssHdr) + n) - ss->state;
                 DEBUG_WRAP(DCE2_DebugMsg(DCE2_DEBUG__PAF,
                             "Setting flush point: %u\n", *fp));
@@ -337,36 +346,37 @@ PAF_Status DCE2_SmbPaf(void *ssn, void **user, const uint8_t *data,
  *  uint32_t - length of payload data
  *  uint32_t - flags to check whether client or server
  *  uint32_t * - pointer to set flush point
+ *  uint32_t * - pointer to set header flush point
  *
  * Returns:
  *  PAF_Status - PAF_FLUSH if flush point found, PAF_SEARCH otherwise
  *
  *********************************************************************/
 PAF_Status DCE2_TcpPaf(void *ssn, void **user, const uint8_t *data,
-        uint32_t len, uint32_t flags, uint32_t *fp)
+        uint32_t len, uint64_t *flags, uint32_t *fp, uint32_t *fp_eoh)
 {
     DCE2_PafTcpState *ds = *(DCE2_PafTcpState **)user;
     uint32_t n = 0;
     int start_state;
     PAF_Status ps = PAF_SEARCH;
     uint32_t tmp_fp = 0;
-    DCE2_SsnData *sd = (DCE2_SsnData *)_dpd.streamAPI->get_application_data(ssn, PP_DCE2);
+    DCE2_SsnData *sd = (DCE2_SsnData *)_dpd.sessionAPI->get_application_data(ssn, PP_DCE2);
     int num_requests = 0;
 
     DEBUG_WRAP(DCE2_DebugMsg(DCE2_DEBUG__PAF, "%s\n", DCE2_DEBUG__PAF_START_MSG));
     DEBUG_WRAP(DCE2_DebugMsg(DCE2_DEBUG__PAF, "TCP: %u bytes of data\n", len));
 
     DCE2_DEBUG_CODE(DCE2_DEBUG__PAF, printf("Session pointer: %p\n",
-                _dpd.streamAPI->get_application_data(ssn, PP_DCE2));)
+                _dpd.sessionAPI->get_application_data(ssn, PP_DCE2));)
 
 #ifdef DEBUG_MSGS
-    if (flags & FLAG_FROM_CLIENT)
+    if (*flags & FLAG_FROM_CLIENT)
         DEBUG_WRAP(DCE2_DebugMsg(DCE2_DEBUG__PAF, "Packet from Client\n"));
     else
         DEBUG_WRAP(DCE2_DebugMsg(DCE2_DEBUG__PAF, "Packet from Server\n"));
 #endif
 
-    if (DCE2_PafAbort(ssn, flags))
+    if (DCE2_PafAbort(ssn, *flags))
     {
         DEBUG_WRAP(DCE2_DebugMsg(DCE2_DEBUG__PAF, "%s\n", DCE2_DEBUG__PAF_END_MSG));
         return PAF_ABORT;
@@ -381,9 +391,9 @@ PAF_Status DCE2_TcpPaf(void *ssn, void **user, const uint8_t *data,
         bool autodetected = false;
 
 #ifdef TARGET_BASED
-        if (_dpd.isAdaptiveConfigured(_dpd.getRuntimePolicy()))
+        if (_dpd.isAdaptiveConfigured())
         {
-            int16_t proto_id = _dpd.streamAPI->get_application_protocol_id(ssn);
+            int16_t proto_id = _dpd.sessionAPI->get_application_protocol_id(ssn);
 
             DEBUG_WRAP(DCE2_DebugMsg(DCE2_DEBUG__PAF, "No session data - checking adaptive "
                                      "to see if it's DCE/RPC.\n"));
@@ -413,9 +423,9 @@ PAF_Status DCE2_TcpPaf(void *ssn, void **user, const uint8_t *data,
 
                 if ((DceRpcCoVersMaj(co_hdr) == DCERPC_PROTO_MAJOR_VERS__5)
                         && (DceRpcCoVersMin(co_hdr) == DCERPC_PROTO_MINOR_VERS__0)
-                        && (((flags & FLAG_FROM_CLIENT)
+                        && (((*flags & FLAG_FROM_CLIENT)
                                 && DceRpcCoPduType(co_hdr) == DCERPC_PDU_TYPE__BIND)
-                            || ((flags & FLAG_FROM_SERVER)
+                            || ((*flags & FLAG_FROM_SERVER)
                                 && DceRpcCoPduType(co_hdr) == DCERPC_PDU_TYPE__BIND_ACK))
                         && (DceRpcCoFragLen(co_hdr) >= sizeof(DceRpcCoHdr)))
                 {
@@ -423,7 +433,7 @@ PAF_Status DCE2_TcpPaf(void *ssn, void **user, const uint8_t *data,
                     DEBUG_WRAP(DCE2_DebugMsg(DCE2_DEBUG__PAF, "Autodetected!\n"));
                 }
             }
-            else if ((*data == DCERPC_PROTO_MAJOR_VERS__5) && (flags & FLAG_FROM_CLIENT))
+            else if ((*data == DCERPC_PROTO_MAJOR_VERS__5) && (*flags & FLAG_FROM_CLIENT))
             {
                 autodetected = true;
                 DEBUG_WRAP(DCE2_DebugMsg(DCE2_DEBUG__PAF, "Autodetected!\n"));
@@ -557,12 +567,12 @@ int DCE2_PafRegisterPort (struct _SnortConfig *sc, uint16_t port, tSfPolicyId pi
     switch (trans)
     {
         case DCE2_TRANS_TYPE__SMB:
-            _dpd.streamAPI->register_paf_port(sc, pid, port, 0, DCE2_SmbPaf, true);
-            _dpd.streamAPI->register_paf_port(sc, pid, port, 1, DCE2_SmbPaf, true);
+            dce2_smbpaf_id = _dpd.streamAPI->register_paf_port(sc, pid, port, 0, DCE2_SmbPaf, true);
+            dce2_smbpaf_id = _dpd.streamAPI->register_paf_port(sc, pid, port, 1, DCE2_SmbPaf, true);
             break;
         case DCE2_TRANS_TYPE__TCP:
-            _dpd.streamAPI->register_paf_port(sc, pid, port, 0, DCE2_TcpPaf, true);
-            _dpd.streamAPI->register_paf_port(sc, pid, port, 1, DCE2_TcpPaf, true);
+            dce2_tcppaf_id = _dpd.streamAPI->register_paf_port(sc, pid, port, 0, DCE2_TcpPaf, true);
+            dce2_tcppaf_id = _dpd.streamAPI->register_paf_port(sc, pid, port, 1, DCE2_TcpPaf, true);
             break;
         default:
             DCE2_Die("Invalid transport type sent to paf registration function");
@@ -580,12 +590,12 @@ int DCE2_PafRegisterService (struct _SnortConfig *sc, uint16_t app_id, tSfPolicy
     switch (trans)
     {
         case DCE2_TRANS_TYPE__SMB:
-            _dpd.streamAPI->register_paf_service(sc, pid, app_id, 0, DCE2_SmbPaf, true);
-            _dpd.streamAPI->register_paf_service(sc, pid, app_id, 1, DCE2_SmbPaf, true);
+            dce2_smbpaf_id = _dpd.streamAPI->register_paf_service(sc, pid, app_id, 0, DCE2_SmbPaf, true);
+            dce2_smbpaf_id = _dpd.streamAPI->register_paf_service(sc, pid, app_id, 1, DCE2_SmbPaf, true);
             break;
         case DCE2_TRANS_TYPE__TCP:
-            _dpd.streamAPI->register_paf_service(sc, pid, app_id, 0, DCE2_TcpPaf, true);
-            _dpd.streamAPI->register_paf_service(sc, pid, app_id, 1, DCE2_TcpPaf, true);
+            dce2_tcppaf_id = _dpd.streamAPI->register_paf_service(sc, pid, app_id, 0, DCE2_TcpPaf, true);
+            dce2_tcppaf_id = _dpd.streamAPI->register_paf_service(sc, pid, app_id, 1, DCE2_TcpPaf, true);
             break;
         default:
             DCE2_Die("Invalid transport type sent to paf registration function");

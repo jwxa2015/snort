@@ -1,7 +1,7 @@
 /*
 **
 **
-**  Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+**  Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
 **  Copyright (C) 2012-2013 Sourcefire, Inc.
 **
 **  This program is free software; you can redistribute it and/or modify
@@ -96,7 +96,7 @@ static int ReadHeader(int socket_fd, FileMessageHeader *hdr)
 
     do
     {
-        numread = read(socket_fd, (*(uint8_t **)&hdr) + total,
+        numread = read(socket_fd, ((unsigned char *)hdr) + total,
                 sizeof(*hdr) - total);
         if (!numread)
             return 0;
@@ -615,7 +615,12 @@ int main(int argc, char *argv[])
     //listen marks the socket as passive socket listening to incoming connections,
     //it allows max 5 backlog connections: backlog connections are pending in queue
     //if pending connections are more than 5, later request may be ignored
-    listen(sockfd,5);
+
+    if (listen(sockfd,5))
+    {
+        ErrorMessage("ERROR on listen.\n");
+        exit(1);
+    }
 
     while (!stop_processing)
     {

@@ -8,7 +8,7 @@
 ** author: marc norton
 ** date:   started 12/21/05
 **
-** Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+** Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
 ** Copyright (C) 2005-2013 Sourcefire, Inc.
 **
 ** General Design
@@ -154,15 +154,18 @@
 
 #include "sf_types.h"
 
+#ifndef DYNAMIC_PREPROC_CONTEXT
 #define BNFA_TRACK_Q
 
 #ifdef BNFA_TRACK_Q
 # include "snort.h"
 #endif
+#endif //DYNAMIC_PREPROC_CONTEXT
 
 #include "bnfa_search.h"
 #include "snort_debug.h"
 #include "util.h"
+#include "sf_dynamic_preprocessor.h"
 
 /*
  * Used to initialize last state, states are limited to 0-16M
@@ -275,6 +278,7 @@ int queue_add (QUEUE * s, int state)
   else
   {
       q = (QNODE *) BNFA_MALLOC (sizeof(QNODE),queue_memory);
+      if(!q) return -1;
       q->state = state;
       q->next = 0;
       s->tail->next = q;
@@ -514,6 +518,7 @@ int bnfaBuildMatchStateTrees(bnfa_struct_t *bnfa,
     return cnt;
 }
 
+#ifndef DYNAMIC_PREPROCESSOR_CONTEXT
 static
 int bnfaBuildMatchStateTreesWithSnortConf(struct _SnortConfig *sc, bnfa_struct_t *bnfa,
                                           int (*build_tree)(struct _SnortConfig *, void *id, void **existing_tree),
@@ -555,6 +560,7 @@ int bnfaBuildMatchStateTreesWithSnortConf(struct _SnortConfig *sc, bnfa_struct_t
 
     return cnt;
 }
+#endif //DYNAMIC_PREPROCESSOR_CONTEXT
 
 #ifdef ALLOW_LIST_PRINT
 /*
@@ -1660,6 +1666,7 @@ bnfaCompile (bnfa_struct_t * bnfa,
     return 0;
 }
 
+#ifndef DYNAMIC_PREPROCESSOR_CONTEXT
 int
 bnfaCompileWithSnortConf (struct _SnortConfig *sc, bnfa_struct_t * bnfa,
                           int (*build_tree)(struct _SnortConfig *, void * id, void **existing_tree),
@@ -1676,6 +1683,7 @@ bnfaCompileWithSnortConf (struct _SnortConfig *sc, bnfa_struct_t * bnfa,
     }
     return 0;
 }
+#endif //DYNAMIC_PREPROCESSOR_CONTEXT
 
 #ifdef ALLOW_NFA_FULL
 

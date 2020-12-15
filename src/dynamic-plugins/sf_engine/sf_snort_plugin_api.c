@@ -16,7 +16,7 @@
  * along with this program; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
  *
- * Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+ * Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
  * Copyright (C) 2005-2013 Sourcefire, Inc.
  *
  * Author: Steve Sturges
@@ -145,6 +145,18 @@ int checkCursorSimple(const uint8_t *cursor, int flags, const uint8_t *start, co
     return CURSOR_OUT_OF_BOUNDS;
 }
 
+int checkCursorSimple_end(const uint8_t *cursor, int flags, const uint8_t *start, const uint8_t *end, int offset)
+{
+    if (cursor == NULL)
+         cursor = end;
+
+    if ((cursor + offset <= end) && (cursor + offset >= start))
+        return CURSOR_IN_BOUNDS;
+
+    return CURSOR_OUT_OF_BOUNDS;
+}
+
+
 /* Returns one if cursor is within the buffer */
 int checkCursorInternal(void *p, int flags, int offset, const uint8_t *cursor)
 {
@@ -186,6 +198,10 @@ int setCursorInternal(void *p, int flags, int offset, const uint8_t **cursor)
     {
         ret = checkCursorSimple(start, flags, start, end, offset);
     }
+    else if ( flags & JUMP_FROM_END )
+    {
+        ret = checkCursorSimple_end(end, flags, start, end, offset);
+    }
     else
     {
         ret = checkCursorSimple(*cursor, flags, start, end, offset);
@@ -199,6 +215,10 @@ int setCursorInternal(void *p, int flags, int offset, const uint8_t **cursor)
     if ( flags & JUMP_FROM_BEGINNING )
     {
         *cursor = start + offset;
+    }
+    else if ( flags & JUMP_FROM_END )
+    {
+        *cursor = end + offset;
     }
     else if ( flags & CONTENT_RELATIVE )
     {
@@ -337,7 +357,7 @@ static int checkFlowInternal(void *p, FlowFlags *flowFlags)
     /* check if this rule only applies to reassembled */
     if (flowFlags->flags & FLOW_ONLY_REASSEMBLED)
     {
-        if ( !(sp->flags & FLAG_REBUILT_STREAM) && !PacketHasFullPDU(sp))
+        if ( !(PacketHasPAFPayload(sp)) )
             return RULE_NOMATCH;
     }
     /* check if this rule only applies to non-reassembled */
@@ -429,7 +449,7 @@ static int fileDataInternal(void *p, CursorInfo* cursorInfo, const uint8_t **cur
     {
         return RULE_NOMATCH;
     }
-    _ded.SetAltDetect(_ded.fileDataBuf->data, _ded.fileDataBuf->len);
+    _ded.SetAltDetect((uint8_t*)_ded.fileDataBuf->data, _ded.fileDataBuf->len);
     retVal = setCursorInternal(p, cursorInfo->flags, cursorInfo->offset, cursor);
 
     if( retVal > RULE_NOMATCH)
@@ -464,10 +484,10 @@ static int base64DataInternal(void *p, CursorInfo* cursorInfo, const uint8_t **c
 
     _ded.SetAltDetect((uint8_t *)base64decodebuf, (uint16_t)base64decodesize);
     retVal = setCursorInternal(p, cursorInfo->flags, cursorInfo->offset, cursor);
-        
+
     if( retVal > RULE_NOMATCH)
         return RULE_MATCH;
-            
+
     _ded.DetectFlag_Disable(SF_FLAG_ALT_DETECT);
     return retVal;
 }
@@ -498,7 +518,7 @@ ENGINE_LINKAGE int base64Decode(void *p, base64DecodeData *data, const uint8_t *
     }
     start = start + data->offset;
 
-    if( start > end )
+    if( start >= end )
         return RULE_NOMATCH;
 
     if(_ded.sfUnfold(start, end-start, (uint8_t *)base64_encodebuf, sizeof(base64_encodebuf), &base64_encodesize) != 0)
@@ -550,10 +570,10 @@ ENGINE_LINKAGE void setAltDetect(uint8_t *buf, uint16_t altLen)
  *    nothing
  *
  */
-ENGINE_LINKAGE int storeRuleData(void *p, void *rule_data,
-        uint32_t sid, SessionDataFree sdf)
+ENGINE_LINKAGE int storeRuleData(void *p, const RuleInformation *info,
+                                 void *rule_data, void *rule_compression_data)
 {
-    if ( _ded.setRuleData(p, rule_data, sid, sdf) != 0 )
+    if ( _ded.setRuleData(p, info, rule_data, rule_compression_data) != 0 )
         return RULE_NOMATCH;
 
     return RULE_MATCH;
@@ -568,9 +588,10 @@ ENGINE_LINKAGE int storeRuleData(void *p, void *rule_data,
  *    pointer to rule specific session data, NULL if none available
  *
  */
-ENGINE_LINKAGE void *getRuleData(void *p, uint32_t sid)
+ENGINE_LINKAGE void getRuleData(void *p, const RuleInformation *info,
+                                void **rule_data, void **rule_compression_data)
 {
-    return _ded.getRuleData(p, sid);
+    _ded.getRuleData(p, info, rule_data, rule_compression_data);
 }
 
 ENGINE_LINKAGE void * allocRuleData(size_t size)
@@ -625,6 +646,9 @@ int isRelativeOption(RuleOption *option)
         /* Never relative */
         break;
     case OPTION_TYPE_BYTE_TEST:
+        relative = option->option_u.byte->flags & CONTENT_RELATIVE;
+        break;
+    case OPTION_TYPE_BYTE_MATH:
         relative = option->option_u.byte->flags & CONTENT_RELATIVE;
         break;
     case OPTION_TYPE_BYTE_JUMP:
@@ -731,6 +755,10 @@ int ruleMatchInternal(SFSnortPacket *p, Rule* rule, uint32_t optIndex, const uin
             retVal = contentMatch(p, rule->options[optIndex]->option_u.content, &thisCursor);
             notFlag = rule->options[optIndex]->option_u.content->flags & NOT_FLAG;
             break;
+        case OPTION_TYPE_PROTECTED_CONTENT:
+            retVal = protectedContentMatch(p, rule->options[optIndex]->option_u.protectedContent, &thisCursor);
+            notFlag = rule->options[optIndex]->option_u.protectedContent->flags & NOT_FLAG;
+            break;
         case OPTION_TYPE_PCRE:
             retVal = pcreMatch(p, rule->options[optIndex]->option_u.pcre, &thisCursor);
             notFlag = rule->options[optIndex]->option_u.pcre->flags & NOT_FLAG;
@@ -740,6 +768,9 @@ int ruleMatchInternal(SFSnortPacket *p, Rule* rule, uint32_t optIndex, const uin
             break;
         case OPTION_TYPE_BYTE_TEST:
             retVal = byteTest(p, rule->options[optIndex]->option_u.byte, thisCursor);
+            break;
+        case OPTION_TYPE_BYTE_MATH:
+            retVal = byteMath(p, rule->options[optIndex]->option_u.byte, thisCursor);
             break;
         case OPTION_TYPE_BYTE_JUMP:
             retVal = byteJump(p, rule->options[optIndex]->option_u.byte, &thisCursor);

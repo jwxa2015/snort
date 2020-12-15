@@ -16,11 +16,11 @@
  * along with this program; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
  *
- * Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+ * Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
  * Copyright (C) 2011-2013 Sourcefire, Inc.
  *
  *
- * Author: Bhagyashree Bantwal <bbantwal@sourcefire.com>
+ * Author: Bhagyashree Bantwal <bbantwal@cisco.com>
  *
  * Description:
  *
@@ -40,6 +40,7 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include <string.h>
+#include <time.h>
 
 #ifdef HAVE_CONFIG_H
 #include "config.h"
@@ -51,11 +52,46 @@
 
 #include "snort_pop.h"
 #include "pop_util.h"
+#include "pop_config.h"
 #include "sf_dynamic_preprocessor.h"
 #include "sf_snort_packet.h"
 #include "Unified2_common.h"
 
 extern POP *pop_ssn;
+
+extern MemPool *pop_mime_mempool;
+extern MemPool *pop_mempool;
+extern POP_Stats pop_stats;
+
+int POP_Print_Mem_Stats(char *buffer)
+{
+    time_t curr_time = time(NULL);
+        
+    return snprintf(buffer, CS_STATS_BUF_SIZE, "\n\nMemory Statistics of POP on: %s\n"
+             "POP Session Statistics:\n"
+             "       Total Sessions seen: " STDu64 "\n"
+             "   Max concurrent sessions: " STDu64 "\n"
+             "   Current Active sessions: " STDu64 "\n"
+             "\n   Memory Pool:\n"
+             "         Free Memory:\n"
+             "             POP Mime Pool: %14zu bytes\n"
+             "                  POP Pool: %14zu bytes\n"
+             "         Used Memory:\n"
+             "             POP Mime Pool: %14zu bytes\n"
+             "                  POP Pool: %14zu bytes\n"
+             "        -------------------       ---------------\n"
+             "         Total Memory:      %14zu bytes\n"
+             , ctime(&curr_time)
+             , pop_stats.sessions
+             , pop_stats.max_conc_sessions
+             , pop_stats.cur_sessions
+             , (pop_mime_mempool) ? (pop_mime_mempool->max_memory - pop_mime_mempool->used_memory) : 0
+             , (pop_mempool) ? (pop_mempool->max_memory - pop_mempool->used_memory) : 0
+             , (pop_mime_mempool) ? pop_mime_mempool->used_memory : 0
+             , (pop_mempool) ? pop_mempool->used_memory : 0
+             , ((pop_mime_mempool) ? (pop_mime_mempool->max_memory) : 0) +
+                          ((pop_mempool) ? (pop_mempool->max_memory) : 0));
+}
 
 void POP_GetEOL(const uint8_t *ptr, const uint8_t *end,
                  const uint8_t **eol, const uint8_t **eolm)
@@ -93,52 +129,6 @@ void POP_GetEOL(const uint8_t *ptr, const uint8_t *end,
 
     *eol = tmp_eol;
     *eolm = tmp_eolm;
-}
-
-void POP_DecodeType(const char *start, int length, bool cnt_xf)
-{
-    const char *tmp = NULL;
-
-    if(cnt_xf)
-    {
-        if(pop_ssn->decode_state->b64_state.encode_depth > -1)
-        {
-            tmp = _dpd.SnortStrcasestr(start, length, "base64");
-            if( tmp != NULL )
-            {
-                pop_ssn->decode_state->decode_type = DECODE_B64;
-                return;
-            }
-        }
-
-        if(pop_ssn->decode_state->qp_state.encode_depth > -1)
-        {
-            tmp = _dpd.SnortStrcasestr(start, length, "quoted-printable");
-            if( tmp != NULL )
-            {
-                pop_ssn->decode_state->decode_type = DECODE_QP;
-                return;
-            }
-        }
-
-        if(pop_ssn->decode_state->uu_state.encode_depth > -1)
-        {
-            tmp = _dpd.SnortStrcasestr(start, length, "uuencode");
-            if( tmp != NULL )
-            {
-                pop_ssn->decode_state->decode_type = DECODE_UU;
-                return;
-            }
-        }
-    }
-
-    if(pop_ssn->decode_state->bitenc_state.depth > -1)
-    {
-        pop_ssn->decode_state->decode_type = DECODE_BITENC;
-        return;
-    }
-
-    return;
 }
 
 

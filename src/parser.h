@@ -1,5 +1,5 @@
 /*
-** Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+** Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
 ** Copyright (C) 2002-2013 Sourcefire, Inc.
 ** Copyright (C) 1998-2002 Martin Roesch <roesch@sourcefire.com>
 ** Copyright (C) 2000-2001 Andrew R. Baker <andrewb@uab.edu>
@@ -37,6 +37,7 @@
 #include "sflsq.h"
 #include "snort.h"
 #include "util.h"
+
 
 /* Macros *********************************************************************/
 /* Rule keywords */
@@ -98,6 +99,7 @@
 #define CONFIG_OPT__DEFAULT_RULE_STATE              "default_rule_state"
 #define CONFIG_OPT__DETECTION                       "detection"
 #define CONFIG_OPT__DETECTION_FILTER                "detection_filter"
+#define CONFIG_OPT__PROTECTED_CONTENT               "protected_content"
 #ifdef INLINE_FAILOPEN
 # define CONFIG_OPT__DISABLE_INLINE_FAILOPEN         "disable_inline_init_failopen"
 #endif
@@ -183,7 +185,8 @@
 #define CONFIG_OPT__PKT_SNAPLEN                     "snaplen"
 #define CONFIG_OPT__PID_PATH                        "pidpath"
 #define CONFIG_OPT__POLICY                          "policy_id"
-#define CONFIG_OPT__POLICY_MODE                     "policy_mode"
+#define CONFIG_OPT__IPS_POLICY_MODE                 "policy_mode"
+#define CONFIG_OPT__NAP_POLICY_MODE                 "na_policy_mode"
 #define CONFIG_OPT__POLICY_VERSION                  "policy_version"
 #ifdef PPM_MGR
 # define CONFIG_OPT__PPM                            "ppm"
@@ -214,9 +217,14 @@
 #define CONFIG_OPT__FILE                            "file"
 #define CONFIG_OPT__TUNNEL_BYPASS                   "tunnel_verdicts"
 #ifdef SIDE_CHANNEL
-# define CONFIG_OPT__SIDE_CHANNEL                    "sidechannel"
+# define CONFIG_OPT__SIDE_CHANNEL                   "sidechannel"
 #endif
-
+#define CONFIG_OPT__MAX_IP6_EXTENSIONS              "max_ip6_extensions"
+#define CONFIG_OPT__DISABLE_REPLACE                 "disable_replace"
+#ifdef DUMP_BUFFER
+#define CONFIG_OPT__BUFFER_DUMP                     "buffer_dump"
+#define CONFIG_OPT__BUFFER_DUMP_ALERT               "buffer_dump_alert"
+#endif
 /* exported values */
 extern char *file_name;
 extern int file_line;
@@ -225,6 +233,7 @@ extern int file_line;
 /* rule setup funcs */
 SnortConfig * ParseSnortConf(void);
 void ParseRules(SnortConfig *);
+IpsPortFilter** ParseIpsPortList (SnortConfig*, IpProto);
 
 void ParseOutput(SnortConfig *, SnortPolicy *, char *);
 void OrderRuleLists(SnortConfig *, char *);
@@ -355,8 +364,10 @@ void ConfigPcreMatchLimitRecursion(SnortConfig *, char *);
 void ConfigPerfFile(SnortConfig *sc, char *);
 void ConfigPidPath(SnortConfig *, char *);
 void ConfigPolicy(SnortConfig *, char *);
-void ConfigPolicyMode(SnortConfig *, char *);
+void ConfigIpsPolicyMode(SnortConfig *, char *);
+void ConfigNapPolicyMode(SnortConfig *, char *);
 void ConfigPolicyVersion(SnortConfig *, char *);
+void ConfigProtectedContent(SnortConfig *, char *);
 #ifdef PPM_MGR
 void ConfigPPM(SnortConfig *, char *);
 #endif
@@ -391,14 +402,21 @@ void ConfigDumpDynamicRulesPath(SnortConfig *, char *);
 void ConfigControlSocketDirectory(SnortConfig *, char *);
 void ConfigFile(SnortConfig *, char *);
 void ConfigTunnelVerdicts(SnortConfig*, char*);
+void ConfigMaxIP6Extensions(SnortConfig *, char*);
+void ConfigDisableReplace(SnortConfig *, char*);
+#ifdef DUMP_BUFFER
+void ConfigBufferDump(SnortConfig *, char *);
+#endif
 
 int addRtnToOtn(
+        SnortConfig *sc,
         OptTreeNode *otn,
         tSfPolicyId policyId,
         RuleTreeNode *rtn
         );
 
 RuleTreeNode* deleteRtnFromOtn(
+        SnortConfig *sc,
         OptTreeNode *otn,
         tSfPolicyId policyId
         );
@@ -435,7 +453,7 @@ static inline RuleTreeNode *getParserRtnFromOtn(SnortConfig *sc, OptTreeNode *ot
 
 static inline RuleTreeNode *getRuntimeRtnFromOtn(OptTreeNode *otn)
 {
-    return getRtnFromOtn(otn, getRuntimePolicy());
+    return getRtnFromOtn(otn, getIpsRuntimePolicy());
 }
 
 SnortPolicy * SnortPolicyNew(void);

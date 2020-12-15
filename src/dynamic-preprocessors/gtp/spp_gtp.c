@@ -1,7 +1,7 @@
 /* $Id */
 
 /*
- ** Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+ ** Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
  ** Copyright (C) 2011-2013 Sourcefire, Inc.
  **
  **
@@ -58,6 +58,10 @@
 #include <stdlib.h>
 #include <ctype.h>
 
+#ifdef DUMP_BUFFER
+#include "gtp_buffer_dump.h"
+#endif
+
 #include "profiler.h"
 #ifdef PERF_PROFILING
 PreprocStats gtpPerfStats;
@@ -93,10 +97,12 @@ static inline int GTP_Process(SFSnortPacket *, GTPData*);
 static void GTPmain( void*, void* );
 static inline int CheckGTPPort( uint16_t );
 static void GTPFreeConfig(tSfPolicyUserContextId);
-static void _addPortsToStream5Filter(struct _SnortConfig *, GTPConfig *, tSfPolicyId);
+static void registerPortsForDispatch( struct _SnortConfig *sc, GTPConfig *policy );
+static void registerPortsForReassembly( GTPConfig *policy, int direction );
+static void _addPortsToStreamFilter(struct _SnortConfig *, GTPConfig *, tSfPolicyId);
 static void GTP_PrintStats(int);
 #ifdef TARGET_BASED
-static void _addServicesToStream5Filter(struct _SnortConfig *, tSfPolicyId);
+static void _addServicesToStreamFilter(struct _SnortConfig *, tSfPolicyId);
 #endif
 
 static void GTPCleanExit(int, void *);
@@ -135,7 +141,17 @@ void SetupGTP(void)
     _dpd.registerPreproc("gtp", GTPInit, GTPReload,
             GTPReloadVerify, GTPReloadSwap, GTPReloadSwapFree);
 #endif
+#ifdef DUMP_BUFFER
+    _dpd.registerBufferTracer(getGTPBuffers, GTP_BUFFER_DUMP_FUNC);
+#endif
 }
+
+#ifdef REG_TEST
+static inline void PrintGTPSize(void)
+{
+    _dpd.logMsg("\nGTP Session Size: %lu\n", (long unsigned int)sizeof(GTPData));
+}
+#endif
 
 /* Initializes the GTP preprocessor module and registers
  * it in the preprocessor list.
@@ -168,7 +184,7 @@ static void GTPInit(struct _SnortConfig *sc, char *argp)
         _dpd.addPreprocExit(GTPCleanExit, NULL, PRIORITY_LAST, PP_GTP);
 
 #ifdef PERF_PROFILING
-        _dpd.addPreprocProfileFunc("gtp", (void *)&gtpPerfStats, 0, _dpd.totalPerfStats);
+        _dpd.addPreprocProfileFunc("gtp", (void *)&gtpPerfStats, 0, _dpd.totalPerfStats, NULL);
 #endif
 
 #ifdef TARGET_BASED
@@ -176,9 +192,14 @@ static void GTPInit(struct _SnortConfig *sc, char *argp)
         if (gtp_app_id == SFTARGET_UNKNOWN_PROTOCOL)
             gtp_app_id = _dpd.addProtocolReference("gtp");
 
+        // register with session to handle applications
+        _dpd.sessionAPI->register_service_handler( PP_GTP, gtp_app_id );
 #endif
     }
 
+#ifdef REG_TEST
+    PrintGTPSize();
+#endif
     sfPolicyUserPolicySet (gtp_config, policy_id);
     pDefaultPolicyConfig = (GTPConfig *)sfPolicyUserDataGetDefault(gtp_config);
     pPolicyConfig = (GTPConfig *)sfPolicyUserDataGetCurrent(gtp_config);
@@ -209,10 +230,13 @@ static void GTPInit(struct _SnortConfig *sc, char *argp)
 
     _dpd.addPreproc( sc, GTPmain, PRIORITY_APPLICATION, PP_GTP, PROTO_BIT__UDP );
 
-    _addPortsToStream5Filter(sc, pPolicyConfig, policy_id);
+    // register ports with session and stream
+    registerPortsForDispatch( sc, pPolicyConfig );
+    registerPortsForReassembly( pPolicyConfig, SSN_DIR_FROM_SERVER | SSN_DIR_FROM_CLIENT );
+    _addPortsToStreamFilter(sc, pPolicyConfig, policy_id);
 
 #ifdef TARGET_BASED
-    _addServicesToStream5Filter(sc, policy_id);
+    _addServicesToStreamFilter(sc, policy_id);
 #endif
 }
 
@@ -288,13 +312,19 @@ static void GTPmain( void* ipacketp, void* contextp )
 #ifdef TARGET_BASED
     int16_t app_id = SFTARGET_UNKNOWN_PROTOCOL;
 #endif
-    tSfPolicyId policy_id = _dpd.getRuntimePolicy();
+    tSfPolicyId policy_id = _dpd.getNapRuntimePolicy();
     PROFILE_VARS;
 
     DEBUG_WRAP(DebugMessage(DEBUG_GTP, "%s\n", GTP_DEBUG__START_MSG));
 
     packetp = (SFSnortPacket*) ipacketp;
     sfPolicyUserPolicySet (gtp_config, policy_id);
+
+#ifdef DUMP_BUFFER
+    dumpBufferInit();
+    dumpBuffer(PAYLOAD_DUMP,packetp->payload,packetp->payload_size);
+#endif
+
 
     // precoditions - what we registered for
     assert(IsUDP(packetp) && packetp->payload && packetp->payload_size);
@@ -304,7 +334,7 @@ static void GTPmain( void* ipacketp, void* contextp )
     gtp_eval_config = sfPolicyUserDataGetCurrent(gtp_config);
 
     /* Attempt to get a previously allocated GTP block. */
-    sessp = _dpd.streamAPI->get_application_data(packetp->stream_session_ptr, PP_GTP);
+    sessp = _dpd.sessionAPI->get_application_data(packetp->stream_session, PP_GTP);
     if (sessp != NULL)
     {
         gtp_eval_config = sfPolicyUserDataGet(sessp->config, sessp->policy_id);
@@ -317,7 +347,7 @@ static void GTPmain( void* ipacketp, void* contextp )
          * running on an GTP port, otherwise no need to examine the traffic.
          */
 #ifdef TARGET_BASED
-        app_id = _dpd.streamAPI->get_application_protocol_id(packetp->stream_session_ptr);
+        app_id = _dpd.sessionAPI->get_application_protocol_id(packetp->stream_session);
         if (app_id == SFTARGET_UNKNOWN_PROTOCOL)
         {
             DEBUG_WRAP(DebugMessage(DEBUG_GTP, "Unknown protocol - not inspecting.\n"));
@@ -371,7 +401,7 @@ static void GTPmain( void* ipacketp, void* contextp )
     /* We're interested in this session. Turn on stream reassembly. */
     if ( !(sessp->state_flags & GTP_FLG_REASSEMBLY_SET ))
     {
-        _dpd.streamAPI->set_reassembly(packetp->stream_session_ptr,
+        _dpd.streamAPI->set_reassembly(packetp->stream_session,
                 STREAM_FLPOLICY_FOOTPRINT, SSN_DIR_BOTH, STREAM_FLPOLICY_SET_ABSOLUTE);
         sessp->state_flags |= GTP_FLG_REASSEMBLY_SET;
     }
@@ -404,7 +434,7 @@ GTPData * GTPGetNewSession(SFSnortPacket *packetp, tSfPolicyId policy_id)
 
     /* Sanity check(s) */
     assert( packetp );
-    if ( !packetp->stream_session_ptr )
+    if ( !packetp->stream_session )
     {
         return NULL;
     }
@@ -415,8 +445,8 @@ GTPData * GTPGetNewSession(SFSnortPacket *packetp, tSfPolicyId policy_id)
         return NULL;
 
     /*Register the new GTP data block in the stream session. */
-    _dpd.streamAPI->set_application_data(
-            packetp->stream_session_ptr,
+    _dpd.sessionAPI->set_application_data(
+            packetp->stream_session,
             PP_GTP, datap, FreeGTPData );
 
     datap->policy_id = policy_id;
@@ -500,6 +530,28 @@ static inline int CheckGTPPort( uint16_t port )
     return GTP_FALSE;
 }
 
+static void registerPortsForDispatch( struct _SnortConfig *sc, GTPConfig *policy )
+{
+    int port;
+
+    for ( port = 0; port < MAXPORTS; port++ )
+    {
+        if( isPortEnabled( policy->ports, port ) )
+            _dpd.sessionAPI->enable_preproc_for_port( sc, PP_GTP, PROTO_BIT__UDP, port ); 
+    }
+}
+
+static void registerPortsForReassembly( GTPConfig *policy, int direction )
+{
+    uint32_t port;
+
+    for ( port = 0; port < MAXPORTS; port++ )
+    {
+        if( isPortEnabled( policy->ports, port ) )
+            _dpd.streamAPI->register_reassembly_port( NULL, port, direction );
+    }
+}
+
 /* **********************************************************************
  * Add ports in the configuration to stream5 filter.
  *
@@ -511,7 +563,7 @@ static inline int CheckGTPPort( uint16_t port )
  * RETURNS: None
  ***********************************************************************/
 
-static void _addPortsToStream5Filter(struct _SnortConfig *sc, GTPConfig *config, tSfPolicyId policy_id)
+static void _addPortsToStreamFilter(struct _SnortConfig *sc, GTPConfig *config, tSfPolicyId policy_id)
 {
     int portNum;
 
@@ -530,7 +582,7 @@ static void _addPortsToStream5Filter(struct _SnortConfig *sc, GTPConfig *config,
 }
 #ifdef TARGET_BASED
 
-static void _addServicesToStream5Filter(struct _SnortConfig *sc, tSfPolicyId policy_id)
+static void _addServicesToStreamFilter(struct _SnortConfig *sc, tSfPolicyId policy_id)
 {
     _dpd.streamAPI->set_service_filter_status(sc, gtp_app_id, PORT_MONITOR_SESSION, policy_id, 1);
 }
@@ -539,7 +591,7 @@ static int GTPCheckPolicyConfig(struct _SnortConfig *sc, tSfPolicyUserContextId 
 {
     _dpd.setParserPolicy(sc, policyId);
 
-    if (!_dpd.isPreprocEnabled(sc, PP_STREAM5))
+    if (!_dpd.isPreprocEnabled(sc, PP_STREAM))
     {
         _dpd.errMsg("GTPCheckPolicyConfig(): The Stream preprocessor must be enabled.\n");
         return -1;
@@ -679,10 +731,13 @@ static void GTPReload(struct _SnortConfig *sc, char *args, void **new_config)
 
     _dpd.addPreproc( sc, GTPmain, PRIORITY_APPLICATION, PP_GTP, PROTO_BIT__UDP );
 
-    _addPortsToStream5Filter(sc, pPolicyConfig, policy_id);
+    // register ports with session and stream
+    registerPortsForDispatch( sc, pPolicyConfig );
+    registerPortsForReassembly( pPolicyConfig, SSN_DIR_FROM_SERVER | SSN_DIR_FROM_CLIENT );
+    _addPortsToStreamFilter(sc, pPolicyConfig, policy_id);
 
 #ifdef TARGET_BASED
-    _addServicesToStream5Filter(sc, policy_id);
+    _addServicesToStreamFilter(sc, policy_id);
 #endif
 }
 
@@ -701,7 +756,7 @@ static int GTPReloadVerify(struct _SnortConfig *sc, void *swap_config)
         return 0;
 
 
-    if (!_dpd.isPreprocEnabled(sc, PP_STREAM5))
+    if (!_dpd.isPreprocEnabled(sc, PP_STREAM))
     {
         _dpd.errMsg("SetupGTP(): The Stream preprocessor must be enabled.\n");
         return -1;

@@ -14,7 +14,7 @@
  * along with this program; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
  *
- * Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+ * Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
  * Copyright (C) 2007-2013 Sourcefire, Inc.
  *
  * Author: Russ Combs
@@ -37,6 +37,7 @@
 typedef enum {
      OPTION_TYPE_PREPROCESSOR,
      OPTION_TYPE_CONTENT,
+     OPTION_TYPE_PROTECTED_CONTENT,
      OPTION_TYPE_PCRE,
      OPTION_TYPE_FLOWBIT,
      OPTION_TYPE_FLOWFLAGS,
@@ -52,10 +53,11 @@ typedef enum {
      OPTION_TYPE_PKT_DATA,
      OPTION_TYPE_BASE64_DATA,
      OPTION_TYPE_BASE64_DECODE,
+     OPTION_TYPE_BYTE_MATH,
      OPTION_TYPE_MAX
 } DynamicOptionType;
 
-// beware: these are redefined from sf_snort_packet.h FLAG_*!
+/* beware: these are redefined from sf_snort_packet.h FLAG_*! */
 #define FLOW_ESTABLISHED         0x0008
 #define FLOW_FR_SERVER           0x0040
 #define FLOW_TO_CLIENT           0x0040 /* Just for convenience */
@@ -67,38 +69,38 @@ typedef enum {
 
 #define SNORT_PCRE_OVERRIDE_MATCH_LIMIT 0x8000000
 
-#ifndef SO_PUBLIC
+#ifndef SF_SO_PUBLIC
 #if defined _WIN32 || defined __CYGWIN__
 #  if defined SF_SNORT_ENGINE_DLL || defined SF_SNORT_DETECTION_DLL || \
       defined SF_SNORT_PREPROC_DLL
 #    ifdef __GNUC__
-#      define SO_PUBLIC __attribute__((dllexport))
+#      define SF_SO_PUBLIC __attribute__((dllexport))
 #    else
-#      define SO_PUBLIC __declspec(dllexport)
+#      define SF_SO_PUBLIC __declspec(dllexport)
 #    endif
 #  else
 #    ifdef __GNUC__
-#      define SO_PUBLIC __attribute__((dllimport))
+#      define SF_SO_PUBLIC __attribute__((dllimport))
 #    else
-#      define SO_PUBLIC __declspec(dllimport)
+#      define SF_SO_PUBLIC __declspec(dllimport)
 #    endif
 #  endif
 #  define DLL_LOCAL
 #else
 #  ifdef SF_VISIBILITY
-#    define SO_PUBLIC  __attribute__ ((visibility("default")))
-#    define SO_PRIVATE __attribute__ ((visibility("hidden")))
+#    define SF_SO_PUBLIC  __attribute__ ((visibility("default")))
+#    define SF_SO_PRIVATE __attribute__ ((visibility("hidden")))
 #  else
-#    define SO_PUBLIC
-#    define SO_PRIVATE
+#    define SF_SO_PUBLIC
+#    define SF_SO_PRIVATE
 #  endif
 #endif
 #endif
 
 /* Parameters are rule info pointer, int to indicate URI or NORM,
  * and list pointer */
-// low nibble must be HTTP_BUFFER_* (see sf_dynamic_common.h)
-// FIXTHIS eliminate these redefines
+/* low nibble must be HTTP_BUFFER_* (see sf_dynamic_common.h) */
+/* FIXTHIS eliminate these redefines */
 #define CONTENT_HTTP_URI          0x00000001
 #define CONTENT_HTTP_HEADER       0x00000002
 #define CONTENT_HTTP_CLIENT_BODY  0x00000003

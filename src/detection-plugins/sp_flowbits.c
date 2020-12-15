@@ -1,7 +1,7 @@
 /*
  ** $Id$
 
- ** Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+ ** Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
  ** Copyright (C) 2003-2013 Sourcefire, Inc.
  **
  ** This program is free software; you can redistribute it and/or modify
@@ -65,6 +65,7 @@
 #include "sf_types.h"
 #include "mstring.h"
 
+#include "session_api.h"
 #include "stream_api.h"
 
 #include "snort.h"
@@ -98,6 +99,10 @@ void FlowBitsGrpFree(void *);
 static void FlowBitsInit(struct _SnortConfig *, char *, OptTreeNode *, int);
 static void FlowBitsParse(struct _SnortConfig *, char *, FLOWBITS_OP *, OptTreeNode *);
 static void FlowBitsCleanExit(int, void *);
+
+#ifdef SNORT_RELOAD
+extern volatile bool reloadInProgress;
+#endif
 
 /****************************************************************************
  *
@@ -261,7 +266,7 @@ void SetupFlowBits(void)
     RegisterRuleOption("flowbits", FlowBitsInit, NULL, OPT_TYPE_DETECTION, NULL);
 
 #ifdef PERF_PROFILING
-    RegisterPreprocessorProfile("flowbits", &flowBitsPerfStats, 3, &ruleOTNEvalPerfStats);
+    RegisterPreprocessorProfile("flowbits", &flowBitsPerfStats, 3, &ruleOTNEvalPerfStats, NULL);
 #endif
 
     AddFuncToCleanExitList(FlowBitsCleanExit, NULL);
@@ -293,19 +298,19 @@ static void FlowBitsInit(struct _SnortConfig *sc, char *data, OptTreeNode *otn, 
     if (otn->sigInfo.generator == 3)
         return;
 
-    /* Flow bits are handled by Stream5 if its enabled */
+    /* Flow bits are handled by Stream if its enabled */
     if( stream_api && stream_api->version != STREAM_API_VERSION5)
     {
         if (ScConfErrorOut())
         {
-            FatalError("WARNING: %s (%d) => flowbits without Stream5. "
-                    "Stream5 must be enabled for this plugin.\n",
+            FatalError("WARNING: %s (%d) => flowbits without Stream. "
+                    "Stream must be enabled for this plugin.\n",
                     file_name,file_line);
         }
         else
         {
-            LogMessage("WARNING: %s (%d) => flowbits without Stream5. "
-                    "Stream5 must be enabled for this plugin.\n",
+            LogMessage("WARNING: %s (%d) => flowbits without Stream. "
+                    "Stream must be enabled for this plugin.\n",
                     file_name,file_line);
         }
     }
@@ -982,7 +987,7 @@ int checkFlowBits( uint8_t type, uint8_t evalType, uint16_t *ids, uint16_t num_i
         return rval;
 
 
-    flowdata = stream_api->get_flow_data(p);
+    flowdata = session_api->get_flow_data(p);
     if(!flowdata)
     {
         DEBUG_WRAP(DebugMessage(DEBUG_FLOWBITS, "No FLOWBITS_DATA"););
@@ -1186,6 +1191,13 @@ void FlowBitsVerify(void)
 
 static void FlowBitsCleanExit(int signal, void *data)
 {
+#ifdef SNORT_RELOAD
+    if (reloadInProgress)
+    {
+        return;
+    }
+#endif
+
     if (flowbits_hash != NULL)
     {
         sfghash_delete(flowbits_hash);

@@ -1,6 +1,6 @@
 /* $Id$ */
 /*
- ** Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+ ** Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
  ** Copyright (C) 2010-2013 Sourcefire, Inc.
  **
  ** This program is free software; you can redistribute it and/or modify
@@ -34,7 +34,10 @@
 #include "sfPolicy.h"
 #include "snort.h"
 #include "spp_normalize.h"
-#include "snort_stream5_tcp.h"
+#include "snort_stream_tcp.h"
+
+// Priority for Normalize preproc
+#define PP_NORMALIZE_PRIORITY PRIORITY_CORE + PP_CORE_ORDER_NORML
 
 static tSfPolicyUserContextId base_set = NULL;
 
@@ -105,9 +108,9 @@ void SetupNormalizer (void)
 static NormalizerContext* Init_GetContext (struct _SnortConfig *sc)
 {
     NormalizerContext* pc = NULL;
-    tSfPolicyId policy_id = getParserPolicy(NULL);
+    tSfPolicyId policy_id = getParserPolicy(sc);
 
-    if ( !ScInlineMode() )
+    if ( ScNapPassiveModeNewConf(sc) )
         return NULL;
 
     if ( !base_set )
@@ -115,6 +118,9 @@ static NormalizerContext* Init_GetContext (struct _SnortConfig *sc)
         base_set = sfPolicyConfigCreate();
         Preproc_Install(sc);
     }
+
+    sc->normalizer_set  = true;
+
     sfPolicyUserPolicySet(base_set, policy_id);
     pc = sfPolicyUserDataGetCurrent(base_set);
 
@@ -122,10 +128,15 @@ static NormalizerContext* Init_GetContext (struct _SnortConfig *sc)
     {
         pc = (NormalizerContext* )SnortAlloc(sizeof(NormalizerContext));
         sfPolicyUserDataSetCurrent(base_set, pc);
-
-        AddFuncToPreprocList(
-            sc, Preproc_Execute, PRIORITY_NORMALIZE, PP_NORMALIZE, PROTO_BITS);
+        if( pc->regFunc != reload)
+        {
+            AddFuncToPreprocList( sc, Preproc_Execute, PP_NORMALIZE_PRIORITY,  PP_NORMALIZE, PROTO_BITS);
+            pc->regFunc = init;
+        }
+        session_api->enable_preproc_all_ports( sc, PP_NORMALIZE, PROTO_BITS );          
     }
+    pc->normMode = ScNapInlineTestModeNewConf(sc) ? NORM_MODE_WOULDA : NORM_MODE_ON;
+
     return pc;
 }
 
@@ -287,9 +298,6 @@ static void Parse_TCP (NormalizerContext* pc, char* args)
     if ( !args ) args = "";
     toks = mSplit(args, ", ", 0, &num_toks, 0);
 
-    // urp is backwards from the rest: on with group and disabled separately
-    Norm_Enable(pc, NORM_TCP_URP);
-
     for (i = 0; i < num_toks; i++)
     {
         switch ( state ) {
@@ -298,9 +306,33 @@ static void Parse_TCP (NormalizerContext* pc, char* args)
             {
                 state = 1;
             }
+            else if ( !strcasecmp(toks[i], "block") )
+            {
+                Norm_Enable(pc, NORM_TCP_BLOCK);
+            }
+            else if ( !strcasecmp(toks[i], "rsv") )
+            {
+                Norm_Enable(pc, NORM_TCP_RSV);
+            }
+            else if ( !strcasecmp(toks[i], "pad") )
+            {
+                Norm_Enable(pc, NORM_TCP_PAD);
+            }
+            else if ( !strcasecmp(toks[i], "req_urg") )
+            {
+                Norm_Enable(pc, NORM_TCP_REQ_URG);
+            }
+            else if ( !strcasecmp(toks[i], "req_pay") )
+            {
+                Norm_Enable(pc, NORM_TCP_REQ_PAY);
+            }
+            else if ( !strcasecmp(toks[i], "req_urp") )
+            {
+                Norm_Enable(pc, NORM_TCP_URP);
+            }
             else if ( !strcasecmp(toks[i], "urp") )
             {
-                Norm_Disable(pc, NORM_TCP_URP);
+                Norm_Enable(pc, NORM_TCP_URP);
             }
             else if ( !strcasecmp(toks[i], "opts") )
             {
@@ -315,9 +347,29 @@ static void Parse_TCP (NormalizerContext* pc, char* args)
             {
                 Norm_Enable(pc, NORM_TCP_IPS);
             }
+            else if ( !strcasecmp(toks[i], "trim_syn") )
+            {
+                Norm_Enable(pc, NORM_TCP_TRIM_SYN);
+            }
+            else if ( !strcasecmp(toks[i], "trim_rst") )
+            {
+                Norm_Enable(pc, NORM_TCP_TRIM_RST);
+            }
+            else if ( !strcasecmp(toks[i], "trim_win") )
+            {
+                Norm_Enable(pc, NORM_TCP_TRIM_WIN);
+            }
+            else if ( !strcasecmp(toks[i], "trim_mss") )
+            {
+                Norm_Enable(pc, NORM_TCP_TRIM_MSS);
+            }
             else if ( !strcasecmp(toks[i], "trim") )
             {
-                Norm_Enable(pc, NORM_TCP_TRIM);
+                //Catch-all / backwards compatible
+                Norm_Enable(pc, NORM_TCP_TRIM_SYN);
+                Norm_Enable(pc, NORM_TCP_TRIM_RST);
+                Norm_Enable(pc, NORM_TCP_TRIM_WIN);
+                Norm_Enable(pc, NORM_TCP_TRIM_MSS);
             }
             else
             {
@@ -412,7 +464,6 @@ static void Parse_TCP (NormalizerContext* pc, char* args)
         ParseError("Missing argument for '%s'", toks[i-1]);
     }
     mSplitFree(&toks, num_toks);
-    Norm_Enable(pc, NORM_TCP);
     Print_TCP(pc);
 }
 
@@ -508,6 +559,12 @@ static void Print_TCP (const NormalizerContext* nc)
             s = OFF;
 
         LogConf("tcp::ecn", s);
+        LogFlag("tcp::block", nc, NORM_TCP_BLOCK);
+        LogFlag("tcp::rsv", nc, NORM_TCP_RSV);
+        LogFlag("tcp::pad", nc, NORM_TCP_PAD);
+        LogFlag("tcp::req_urg", nc, NORM_TCP_REQ_URG);
+        LogFlag("tcp::req_pay", nc, NORM_TCP_REQ_PAY);
+        LogFlag("tcp::req_urp", nc, NORM_TCP_REQ_URP);
         LogFlag("tcp::urp", nc, NORM_TCP_URP);
 
         if ( Norm_IsEnabled(nc, NORM_TCP_OPT) )
@@ -538,6 +595,10 @@ static void Print_TCP (const NormalizerContext* nc)
             LogConf("tcp::opt", OFF);
 
         LogFlag("tcp::ips", nc, NORM_TCP_IPS);
+        LogFlag("tcp::trim_syn", nc, NORM_TCP_TRIM_SYN);
+        LogFlag("tcp::trim_rst", nc, NORM_TCP_TRIM_RST);
+        LogFlag("tcp::trim_win", nc, NORM_TCP_TRIM_WIN);
+        LogFlag("tcp::trim_mss", nc, NORM_TCP_TRIM_MSS);
     }
 }
 
@@ -549,16 +610,16 @@ static void Preproc_Install (struct _SnortConfig *sc)
 {
 #ifdef PERF_PROFILING
     RegisterPreprocessorProfile(
-        "normalize", &norm_perf_stats, 0, &totalPerfStats);
+        "normalize", &norm_perf_stats, 0, &totalPerfStats, NULL);
 #endif
     AddFuncToPreprocCleanExitList(
         Preproc_CleanExit, NULL, PRIORITY_LAST, PP_NORMALIZE);
 
     AddFuncToPreprocResetList(
-        Preproc_Reset, NULL, PRIORITY_FIRST, PP_NORMALIZE);
+        Preproc_Reset, NULL, PP_NORMALIZE_PRIORITY, PP_NORMALIZE);
 
     AddFuncToPreprocResetStatsList(
-        Preproc_ResetStats, NULL, PRIORITY_FIRST, PP_NORMALIZE);
+        Preproc_ResetStats, NULL, PP_NORMALIZE_PRIORITY, PP_NORMALIZE);
 
     AddFuncToConfigCheckList(sc, Preproc_CheckConfig);
     AddFuncToPreprocPostConfigList(sc, Preproc_PostConfigInit, NULL);
@@ -616,7 +677,7 @@ static void Preproc_PostConfigInit (struct _SnortConfig *sc, void* pv)
 
 static void Preproc_Execute (Packet *p, void *context)
 {
-    tSfPolicyId pid = getRuntimePolicy();
+    tSfPolicyId pid = getNapRuntimePolicy();
     NormalizerContext* pc = (NormalizerContext*)sfPolicyUserDataGet(base_set, pid);
     PROFILE_VARS;
 
@@ -625,8 +686,10 @@ static void Preproc_Execute (Packet *p, void *context)
 
     PREPROC_PROFILE_START(norm_perf_stats);
 
-    if ( !Active_PacketWasDropped() )
-        Norm_Packet(pc, p);
+    if ( DAQ_GetInterfaceMode(p->pkth) == DAQ_MODE_INLINE )
+        if ( !Active_PacketWasDropped() )
+            if ( pc->normMode == NORM_MODE_ON || pc->normMode == NORM_MODE_WOULDA )
+                Norm_Packet(pc, p);
 
     PREPROC_PROFILE_END(norm_perf_stats);
     return;
@@ -674,7 +737,7 @@ static void Preproc_Reset (int signal, void *foo) { }
 
 static void Preproc_PrintStats(int exiting)
 {
-    if(ScInlineMode())
+    if(!ScNapPassiveMode())
     {
         Norm_PrintStats();
         Stream_PrintNormalizationStats();
@@ -698,7 +761,7 @@ static NormalizerContext* Reload_GetContext (struct _SnortConfig *sc, void **new
     NormalizerContext* pc = NULL;
     tSfPolicyId policy_id = getParserPolicy(sc);
 
-    if ( sc->targeted_policies[policy_id]->policy_mode != POLICY_MODE__INLINE )
+    if ( ScNapPassiveModeNewConf(sc) )
         return NULL;
 
     if (!(swap_set = (tSfPolicyUserContextId)*new_config))
@@ -713,6 +776,9 @@ static NormalizerContext* Reload_GetContext (struct _SnortConfig *sc, void **new
         swap_set = sfPolicyConfigCreate();
         *new_config = (void *)swap_set;
     }
+
+    sc->normalizer_set  = true;
+
     sfPolicyUserPolicySet(swap_set, policy_id);
     pc = sfPolicyUserDataGetCurrent(swap_set);
 
@@ -721,9 +787,19 @@ static NormalizerContext* Reload_GetContext (struct _SnortConfig *sc, void **new
         pc = (NormalizerContext* )SnortAlloc(sizeof(NormalizerContext));
         sfPolicyUserDataSetCurrent(swap_set, pc);
 
-        AddFuncToPreprocList(
-            sc, Preproc_Execute, PRIORITY_NORMALIZE, PP_NORMALIZE, PROTO_BITS);
+        if( pc->regFunc != init)
+        {
+            AddFuncToPreprocList(
+                sc, Preproc_Execute, PP_NORMALIZE_PRIORITY, PP_NORMALIZE, PROTO_BITS);
+            pc->regFunc = reload;
+        }
+        session_api->enable_preproc_all_ports( sc, PP_NORMALIZE, PROTO_BITS );          
+  
     }
+    if ( sc->targeted_policies[policy_id]->nap_policy_mode == POLICY_MODE__INLINE_TEST )
+        pc->normMode = NORM_MODE_WOULDA;
+    else
+        pc->normMode = NORM_MODE_ON;
     return pc;
 }
 
@@ -734,7 +810,7 @@ static void Reload_IP4 (struct _SnortConfig *sc, char* args, void **new_config)
     if ( pc )
         Parse_IP4(sc, pc, args);
     else
-        LogMessage(NOT_INLINE, "tcp");
+        LogMessage(NOT_INLINE, "ip4");
 }
 
 static void Reload_ICMP4 (struct _SnortConfig *sc, char* args, void **new_config)
@@ -744,7 +820,7 @@ static void Reload_ICMP4 (struct _SnortConfig *sc, char* args, void **new_config
     if ( pc )
         Parse_ICMP4(pc, args);
     else
-        LogMessage(NOT_INLINE, "tcp");
+        LogMessage(NOT_INLINE, "icmp4");
 }
 
 static void Reload_IP6 (struct _SnortConfig *sc, char* args, void **new_config)
@@ -754,7 +830,7 @@ static void Reload_IP6 (struct _SnortConfig *sc, char* args, void **new_config)
     if ( pc )
         Parse_IP6(sc, pc, args);
     else
-        LogMessage(NOT_INLINE, "tcp");
+        LogMessage(NOT_INLINE, "ip6");
 }
 
 static void Reload_ICMP6 (struct _SnortConfig *sc, char* args, void **new_config)
@@ -764,7 +840,7 @@ static void Reload_ICMP6 (struct _SnortConfig *sc, char* args, void **new_config
     if ( pc )
         Parse_ICMP6(pc, args);
     else
-        LogMessage(NOT_INLINE, "tcp");
+        LogMessage(NOT_INLINE, "icmp6");
 }
 
 static void Reload_TCP (struct _SnortConfig *sc, char* args, void **new_config)
@@ -860,19 +936,26 @@ static void Reload_Free (void* pv)
 // public methods
 //-------------------------------------------------------------------------
 
-int Normalize_IsEnabled (const SnortConfig* sc, NormFlags nf)
+NormMode Normalize_GetMode (const SnortConfig* sc, NormFlags nf)
 {
     tSfPolicyId pid;
     NormalizerContext* pc;
 
-    if ( !base_set ) return 0;
+    if ( !base_set )
+        return NORM_MODE_OFF;
 
-    pid = getRuntimePolicy();
+    if (!sc->normalizer_set)
+        return NORM_MODE_OFF;
+
+    pid = getNapRuntimePolicy();
     pc = sfPolicyUserDataGet(base_set, pid);
 
-    if ( !pc ) return 0;
+    if ( !pc )
+         return NORM_MODE_OFF;
 
-    return Norm_IsEnabled(pc, nf);
+    if ( Norm_IsEnabled(pc, nf) )
+        return pc->normMode;
+    return NORM_MODE_OFF;
 }
 
 #endif  // NORMALIZER

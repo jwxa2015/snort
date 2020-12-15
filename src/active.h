@@ -1,7 +1,7 @@
 /* $Id$ */
 /****************************************************************************
  *
- * Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+ * Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
  * Copyright (C) 2005-2013 Sourcefire, Inc.
  *
  * This program is free software; you can redistribute it and/or modify
@@ -52,8 +52,9 @@ void Active_KillSession(Packet*, EncodeFlags*);
 
 void Active_SendReset(Packet*, EncodeFlags);
 void Active_SendUnreach(Packet*, EncodeType);
-void Active_SendData(Packet*, EncodeFlags, const uint8_t* buf, uint32_t len);
+bool Active_SendData(Packet*, EncodeFlags, const uint8_t* buf, uint32_t len);
 void Active_InjectData(Packet*, EncodeFlags, const uint8_t* buf, uint32_t len);
+void Active_UDPInjectData(Packet*, EncodeFlags, const uint8_t* buf, uint32_t len);
 
 int Active_IsRSTCandidate(const Packet*);
 int Active_IsUNRCandidate(const Packet*);
@@ -68,11 +69,18 @@ typedef enum {
     ACTIVE_CANT_DROP,   // can't drop
     ACTIVE_WOULD_DROP,  // would drop
     ACTIVE_DROP,        // should drop
-    ACTIVE_FORCE_DROP   // must drop
+    ACTIVE_FORCE_DROP,  // must drop
+    ACTIVE_RETRY        // queue for retry
 } tActiveDrop;
 
+typedef enum {
+    ACTIVE_SSN_ALLOW,       // don't drop
+    ACTIVE_SSN_DROP,        // can drop and reset
+    ACTIVE_SSN_DROP_WITHOUT_RESET  // can drop but without reset
+} tActiveSsnDrop;
+
 extern tActiveDrop active_drop_pkt;
-extern int active_drop_ssn;
+extern tActiveSsnDrop active_drop_ssn;
 #ifdef ACTIVE_RESPONSE
 extern int active_have_rsp;
 #endif
@@ -82,7 +90,7 @@ extern int active_suspend;
 static inline void Active_Reset (void)
 {
     active_drop_pkt = ACTIVE_ALLOW;
-    active_drop_ssn = 0;
+    active_drop_ssn = ACTIVE_SSN_ALLOW;
 #ifdef ACTIVE_RESPONSE
     active_have_rsp = 0;
 #endif
@@ -104,7 +112,7 @@ static inline bool Active_Suspended (void)
     return ( active_suspend != 0 );
 }
 
-static tActiveDrop Active_GetDisposition (void)
+static inline tActiveDrop Active_GetDisposition (void)
 {
     return active_drop_pkt;
 }
@@ -121,16 +129,15 @@ static inline void Active_CantDrop(void)
 #endif
 }
 
-static inline void Active_ForceDropPacket (void)
+static inline void Active_ForceDropPacket( void )
 {
     if ( Active_Suspended() )
         Active_CantDrop();
-
     else
         active_drop_pkt = ACTIVE_FORCE_DROP;
 }
 
-static inline void Active_DropPacket (const Packet* p)
+static inline void Active_NapDropPacket( const Packet* p )
 {
     if ( Active_Suspended() )
     {
@@ -138,40 +145,113 @@ static inline void Active_DropPacket (const Packet* p)
     }
     else if ( active_drop_pkt != ACTIVE_FORCE_DROP )
     {
-        if ( ScInlineMode() )
+        if ( ScNapInlineMode() )
         {
             if ( DAQ_GetInterfaceMode(p->pkth) == DAQ_MODE_INLINE )
                 active_drop_pkt = ACTIVE_DROP;
             else
                 active_drop_pkt = ACTIVE_WOULD_DROP;
         }
-        else if (ScInlineTestMode())
+        else if (ScNapInlineTestMode())
         {
             active_drop_pkt = ACTIVE_WOULD_DROP;
         }
     }
 }
 
-static inline void Active_DropSession (const Packet* p)
+static inline void Active_DropPacket( const Packet* p )
+{
+    if ( Active_Suspended() )
+    {
+        Active_CantDrop();
+    }
+    else if ( active_drop_pkt != ACTIVE_FORCE_DROP )
+    {
+        if ( ScIpsInlineMode() )
+        {
+            if ( DAQ_GetInterfaceMode(p->pkth) == DAQ_MODE_INLINE )
+                active_drop_pkt = ACTIVE_DROP;
+            else
+                active_drop_pkt = ACTIVE_WOULD_DROP;
+        }
+        else if (ScIpsInlineTestMode())
+        {
+            active_drop_pkt = ACTIVE_WOULD_DROP;
+        }
+    }
+}
+
+static inline bool Active_DAQRetryPacket( const Packet *p )
+{
+    bool retry_queued = false;
+
+    if( ( active_drop_pkt == ACTIVE_ALLOW ) && DAQ_CanRetry( ) )
+    {
+        if ( DAQ_GetInterfaceMode(p->pkth) == DAQ_MODE_INLINE )
+        {
+            active_drop_pkt = ACTIVE_RETRY;
+            retry_queued = true;
+        }
+    }
+
+    return retry_queued;
+}
+
+static inline void Active_DAQDropPacket(const Packet *p)
+{
+    if ( Active_Suspended() )
+    {
+        Active_CantDrop();
+    }
+    else if ( active_drop_pkt != ACTIVE_FORCE_DROP )
+    {
+        if ( DAQ_GetInterfaceMode(p->pkth) == DAQ_MODE_INLINE )
+            active_drop_pkt = ACTIVE_DROP;
+        else
+            active_drop_pkt = ACTIVE_WOULD_DROP;
+    }
+}
+
+static inline void _Active_DropSession (const Packet* p, tActiveSsnDrop ssn_drop)
 {
     if ( Active_Suspended() )
     {
         Active_CantDrop();
         return;
     }
-    active_drop_ssn = 1;
+    active_drop_ssn = ssn_drop;
     Active_DropPacket(p);
+}
+
+static inline void _Active_ForceDropSession (tActiveSsnDrop ssn_drop)
+{
+    if ( Active_Suspended() )
+    {
+        Active_CantDrop();
+        return;
+    }
+    active_drop_ssn = ssn_drop;
+    Active_ForceDropPacket();
+}
+
+static inline void Active_DropSession (const Packet* p)
+{
+    _Active_DropSession(p, ACTIVE_SSN_DROP);
 }
 
 static inline void Active_ForceDropSession (void)
 {
-    if ( Active_Suspended() )
-    {
-        Active_CantDrop();
-        return;
-    }
-    active_drop_ssn = 1;
-    Active_ForceDropPacket();
+    _Active_ForceDropSession(ACTIVE_SSN_DROP);
+}
+
+static inline void Active_DropSessionWithoutReset (const Packet* p)
+{
+    _Active_DropSession(p, ACTIVE_SSN_DROP_WITHOUT_RESET);
+}
+
+static inline void Active_ForceDropSessionWithoutReset (void)
+{
+    _Active_ForceDropSession(ACTIVE_SSN_DROP_WITHOUT_RESET);
 }
 
 static inline int Active_PacketWouldBeDropped (void)
@@ -189,15 +269,20 @@ static inline int Active_PacketWasDropped (void)
     return ( active_drop_pkt >= ACTIVE_DROP );
 }
 
+static inline int Active_RetryIsPending (void)
+{
+    return ( active_drop_pkt == ACTIVE_RETRY );
+}
+
 static inline int Active_SessionWasDropped (void)
 {
-    return ( active_drop_ssn != 0 );
+    return ( active_drop_ssn != ACTIVE_SSN_ALLOW );
 }
 
 #ifdef ACTIVE_RESPONSE
 static inline int Active_ResponseQueued (void)
 {
-    return ( active_have_rsp != 0 );
+    return ( active_have_rsp != ACTIVE_SSN_ALLOW );
 }
 #endif
 

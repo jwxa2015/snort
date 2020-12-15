@@ -3,9 +3,9 @@ AUTOMAKE_OPTIONS=foreign no-dependencies
 
 INCLUDES = -I../include -I${srcdir}/../libs
 
-libdir = ${exec_prefix}/lib/snort_dynamicpreprocessor
+dynamicpreprocessordir = ${libdir}/snort_dynamicpreprocessor
 
-lib_LTLIBRARIES = libsf_sdf_preproc.la
+dynamicpreprocessor_LTLIBRARIES = libsf_sdf_preproc.la
 
 libsf_sdf_preproc_la_LDFLAGS = -export-dynamic -module @XCCFLAGS@
 if SO_WITH_STATIC_LIB
@@ -29,8 +29,9 @@ sdf_detection_option.c \
 sdf_detection_option.h
 
 EXTRA_DIST = \
+sf_sdf.vcxproj \
 sf_sdf.dsp
 
 all-local: $(LTLIBRARIES)
-	$(MAKE) DESTDIR=`pwd`/../build install-libLTLIBRARIES
+	$(MAKE) DESTDIR=`pwd`/../build install-dynamicpreprocessorLTLIBRARIES
 

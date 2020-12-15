@@ -1,5 +1,5 @@
 /****************************************************************************
- * Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+ * Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
  * Copyright (C) 2011-2013 Sourcefire, Inc.
  *
  * This program is free software; you can redistribute it and/or modify
@@ -67,7 +67,7 @@ static int SIP_MethodAddFastPatterns(void *, int, int, FPContentInfo **);
 static inline int SIP_RoptDoEval(SFSnortPacket *p)
 {
 	if ((p->payload_size == 0) ||
-			(p->stream_session_ptr == NULL) ||
+			(p->stream_session == NULL) ||
 			(!IsTCP(p) && !IsUDP(p)))
 	{
 
@@ -190,7 +190,7 @@ static int SIP_MethodEval(void *pkt, const uint8_t **cursor, void *data)
 	if (!SIP_RoptDoEval(p))
 		return RULE_NOMATCH;
 
-	sd = (SIPData *)_dpd.streamAPI->get_application_data(p->stream_session_ptr, PP_SIP);
+	sd = (SIPData *)_dpd.sessionAPI->get_application_data(p->stream_session, PP_SIP);
 	if (sd == NULL)
 	{
 		DEBUG_WRAP(DebugMessage(DEBUG_SIP,
@@ -215,36 +215,35 @@ static int SIP_MethodEval(void *pkt, const uint8_t **cursor, void *data)
 static int SIP_MethodAddFastPatterns(void *data, int protocol,
 		int direction, FPContentInfo **info)
 {
+    char *sip = "SIP";
+    FPContentInfo *method_fp;
+    SipMethodRuleOptData *sdata = (SipMethodRuleOptData *)data;
+    DEBUG_WRAP(DebugMessage(DEBUG_SIP,
+        "Evaluating \"%s\" fast pattern rule option.\n", SIP_ROPT__METHOD));
+    if ((sdata == NULL) || (info == NULL))
+        return -1;
 
-	char *sip = "SIP";
-	FPContentInfo *method_fp;
-	SipMethodRuleOptData *sdata = (SipMethodRuleOptData *)data;
-	DEBUG_WRAP(DebugMessage(DEBUG_SIP,
-				"Evaluating \"%s\" fast pattern rule option.\n", SIP_ROPT__METHOD));
-	if ((sdata == NULL) || (info == NULL))
-		return -1;
+    if ((protocol != IPPROTO_TCP) && (protocol != IPPROTO_UDP))
+        return -1;
 
-	if ((protocol != IPPROTO_TCP) && (protocol != IPPROTO_UDP))
-		return -1;
+    DEBUG_WRAP(DebugMessage(DEBUG_SIP,
+        "adding info to \"%s\" fast pattern rule option.\n", SIP_ROPT__METHOD));
 
-	DEBUG_WRAP(DebugMessage(DEBUG_SIP,
-					"adding info to \"%s\" fast pattern rule option.\n", SIP_ROPT__METHOD));
-
-	method_fp = (FPContentInfo *)calloc(1,sizeof(FPContentInfo));
+    method_fp = (FPContentInfo *)calloc(1,sizeof(FPContentInfo));
     if (NULL == method_fp)
-    	return -1;
+        return -1;
 
-	method_fp->content = (char *)malloc(strlen(sip));
-	if (NULL == method_fp->content)
+    method_fp->content = (char *)malloc(strlen(sip));
+    if (NULL == method_fp->content)
     {
         free(method_fp);
-		return -1;
+        return -1;
     }
 
-	memcpy(method_fp->content, sip, strlen(sip));
-	method_fp->length =  strlen(sip);
+    memcpy(method_fp->content, sip, strlen(sip));
+    method_fp->length =  strlen(sip);
     *info = method_fp;
-	return 0;
+    return 0;
 }
 /* Parsing for the rule option */
 static int SIP_HeaderInit(struct _SnortConfig *sc, char *name, char *params, void **data)
@@ -275,7 +274,7 @@ static int SIP_HeaderEval(void *pkt, const uint8_t **cursor, void *data)
 	if (!SIP_RoptDoEval(p))
 		return RULE_NOMATCH;
 
-	sd = (SIPData *)_dpd.streamAPI->get_application_data(p->stream_session_ptr, PP_SIP);
+	sd = (SIPData *)_dpd.sessionAPI->get_application_data(p->stream_session, PP_SIP);
 	if (sd == NULL)
 	{
 		DEBUG_WRAP(DebugMessage(DEBUG_SIP,
@@ -373,7 +372,7 @@ static int SIP_StatCodeEval(void *pkt, const uint8_t **cursor, void *data)
 	if (!SIP_RoptDoEval(p))
 		return RULE_NOMATCH;
 
-	sd = (SIPData *)_dpd.streamAPI->get_application_data(p->stream_session_ptr, PP_SIP);
+	sd = (SIPData *)_dpd.sessionAPI->get_application_data(p->stream_session, PP_SIP);
 	if (sd == NULL)
 	{
 		DEBUG_WRAP(DebugMessage(DEBUG_SIP,
@@ -432,7 +431,7 @@ static int SIP_BodyEval(void *pkt, const uint8_t **cursor, void *data)
 	if (!SIP_RoptDoEval(p))
 		return RULE_NOMATCH;
 
-	sd = (SIPData *)_dpd.streamAPI->get_application_data(p->stream_session_ptr, PP_SIP);
+	sd = (SIPData *)_dpd.sessionAPI->get_application_data(p->stream_session, PP_SIP);
 	if (sd == NULL)
 	{
 		DEBUG_WRAP(DebugMessage(DEBUG_SIP,

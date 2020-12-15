@@ -1,6 +1,6 @@
 /* $Id$ */
 /*
- ** Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+ ** Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
  ** Copyright (C) 2002-2013 Sourcefire, Inc.
  ** Author: Martin Roesch
  **
@@ -192,7 +192,7 @@ void SetupClientServer(void)
     RegisterRuleOption("flow", FlowInit, NULL, OPT_TYPE_DETECTION, NULL);
 
 #ifdef PERF_PROFILING
-    RegisterPreprocessorProfile("flow", &flowCheckPerfStats, 3, &ruleOTNEvalPerfStats);
+    RegisterPreprocessorProfile("flow", &flowCheckPerfStats, 3, &ruleOTNEvalPerfStats, NULL);
 #endif
 
     DEBUG_WRAP(DebugMessage(DEBUG_PLUGIN,
@@ -251,7 +251,7 @@ static inline void CheckStream(char *token)
 {
     if (!stream_api)
     {
-        FatalError("%s(%d): Stream5 must be enabled to use the '%s' option.\n",
+        FatalError("%s(%d): Stream must be enabled to use the '%s' option.\n",
             file_name, file_line, token);
     }
 }
@@ -536,9 +536,8 @@ int CheckFlow(void *option_data, Packet *p)
     /* ...only_reassembled */
     if (csd->only_reassembled & ONLY_STREAM)
     {
-        if ( !(p->packet_flags & PKT_REBUILT_STREAM)
-            && !PacketHasFullPDU(p)
-        ) {
+        if ( !PacketHasPAFPayload(p)) 
+        {
             PREPROC_PROFILE_END(flowCheckPerfStats);
             return DETECTION_OPTION_NO_MATCH;
         }

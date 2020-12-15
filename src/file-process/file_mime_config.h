@@ -1,5 +1,5 @@
 /*
- ** Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+ ** Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
  ** Copyright (C) 2012-2013 Sourcefire, Inc.
  **
  ** This program is free software; you can redistribute it and/or modify
@@ -24,17 +24,18 @@
  */
 
 
-#ifndef __IMAP_CONFIG_H__
-#define __IMAP_CONFIG_H__
+#ifndef __FILE_MIME_CONFIG_H__
+#define __FILE_MIME_CONFIG_H__
 
 #include "file_api.h"
+#include "file_mail_common.h"
 
 /* Function prototypes  */
 void set_mime_decode_config_defauts(DecodeConfig *decode_conf);
 void set_mime_log_config_defauts(MAIL_LogConfig *log_config);
-int parse_mime_decode_args(DecodeConfig *decode_conf, char *arg, const char *preproc_name);
+int parse_mime_decode_args(DecodeConfig *decode_conf, char *arg, const char *preproc_name, char **strtok_saveptr);
 bool is_decoding_enabled(DecodeConfig *decode_conf);
 bool is_mime_log_enabled(MAIL_LogConfig *log_config);
-bool is_decoding_conf_changed(DecodeConfig *configNext, DecodeConfig *config, const char *preproc_name);
+bool check_decode_config(DecodeConfig *currentConfig, DecodeConfig *defaultConfig, const char *preproc_name);
 #endif
 

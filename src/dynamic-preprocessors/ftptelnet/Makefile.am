@@ -1,22 +1,27 @@
 ## $Id
 AUTOMAKE_OPTIONS=foreign no-dependencies
 
-INCLUDES = -I../include -I${srcdir}/../libs -I$(srcdir)/includes
+INCLUDES = -I../include -I${srcdir}/../ssl_common -I${srcdir}/../libs -I${srcdir}/includes
 
-libdir = ${exec_prefix}/lib/snort_dynamicpreprocessor
+dynamicpreprocessordir = ${libdir}/snort_dynamicpreprocessor
 
-lib_LTLIBRARIES = libsf_ftptelnet_preproc.la
+dynamicpreprocessor_LTLIBRARIES = libsf_ftptelnet_preproc.la
 
 libsf_ftptelnet_preproc_la_LDFLAGS = -export-dynamic -module @XCCFLAGS@
 if SO_WITH_STATIC_LIB
-libsf_ftptelnet_preproc_la_LIBADD = ../libsf_dynamic_preproc.la
+libsf_ftptelnet_preproc_la_LIBADD = ../libsf_dynamic_preproc.la ../libsf_dynamic_utils.la
 else
 nodist_libsf_ftptelnet_preproc_la_SOURCES = \
 ../include/sf_dynamic_preproc_lib.c \
 ../include/sf_ip.c \
 ../include/sfrt.c \
 ../include/sfrt_dir.c \
-../include/sfPolicyUserData.c
+../include/sfPolicyUserData.c \
+../include/sfmemcap.c \
+../ssl_common/ssl.c \
+../ssl_common/ssl_config.c \
+../ssl_common/ssl_inspect.c \
+../libs/sfparser.c
 endif
 
 libsf_ftptelnet_preproc_la_SOURCES = \
@@ -53,9 +58,17 @@ snort_ftptelnet.h \
 spp_ftptelnet.c \
 spp_ftptelnet.h
 
+if BUILD_BUFFER_DUMP
+libsf_ftptelnet_preproc_la_SOURCES += \
+ftptelnet_buffer_dump.c \
+ftptelnet_buffer_dump.h
+endif
+
+
 EXTRA_DIST = \
+sf_ftptelnet.vcxproj \
 sf_ftptelnet.dsp
 
 all-local: $(LTLIBRARIES)
-	$(MAKE) DESTDIR=`pwd`/../build install-libLTLIBRARIES
+	$(MAKE) DESTDIR=`pwd`/../build install-dynamicpreprocessorLTLIBRARIES
 

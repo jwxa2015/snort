@@ -1,14 +1,21 @@
-2014-07-09 - Snort 2.9.6.2
-[*] New additions
-* Added the ability to specify additional custom 'x-forwarder-for' http field names. 
-  A new http inspection configuration element is used to specify a set of
-  field names and their respective precedence order.  
+2020-10-30 - Snort 2.9.17
 
-* Added cache flow timeout for IP.
+[*] New Additions
 
-[*] Improvements
-* Fixed handling of ICMPv6 traffic.
+	Added support for s7Commplus protocol.
 
-* Fixed inline stream reassembly during file processing.
+	Support for allowing common names across rule options.
 
-* Addressed race condition issue with Perfmon stats file rollover.
+	Added support to detect TCP Fast Open packets. 
+
+[*] Improvements / Fix
+
+	Added support for HTTP range field parsing to detect if HTTP response/request is indeed partial or full content.
+
+	Fixed TCP segment queue hole issue as per the RFC793 recommendation for OOO Ack packet handling.
+
+	Fixed multiple static analysis issues.
+
+	Miscellaneous SMB bug fixes.
+
+

@@ -1,7 +1,7 @@
 /* $Id */
 
 /*
- ** Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+ ** Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
  ** Copyright (C) 2011-2013 Sourcefire, Inc.
  **
  **
@@ -47,6 +47,7 @@
 #include "sip_roptions.h"
 #include "sip_parser.h"
 #include "sip_dialog.h"
+#include "sip_paf.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -59,12 +60,24 @@
 #include <stdlib.h>
 #include <ctype.h>
 
+#ifdef REG_TEST
+#include "reg_test.h"
+#endif
+
 #include "profiler.h"
 #ifdef PERF_PROFILING
 PreprocStats sipPerfStats;
 #endif
 
 #include "sf_types.h"
+
+#ifdef DUMP_BUFFER
+#include "sip_buffer_dump.h"
+#endif
+
+#ifdef SNORT_RELOAD
+#include "appdata_adjuster.h"
+#endif
 
 const int MAJOR_VERSION = 1;
 const int MINOR_VERSION = 1;
@@ -83,22 +96,27 @@ int16_t sip_app_id = SFTARGET_UNKNOWN_PROTOCOL;
  */
 
 #define SIP_FLG_MISSED_PACKETS        (0x10000)
-#define SIP_FLG_REASSEMBLY_SET        (0x20000)
+
 /*
  * Function prototype(s)
  */
 SIPData * SIPGetNewSession(SFSnortPacket *, tSfPolicyId);
 static void SIPInit( struct _SnortConfig *, char* );
+static bool SIPGlobalIsEnabled(struct _SnortConfig *sc, tSfPolicyUserContextId sip_config);
+static int SIPPolicyIsEnabled(struct _SnortConfig *sc, tSfPolicyUserContextId pContext, tSfPolicyId policyId, void* config);
 static int SIPCheckConfig(struct _SnortConfig *);
 static void FreeSIPData( void* );
 static inline int SIP_Process(SFSnortPacket *, SIPData*);
 static void SIPmain( void*, void* );
 static inline int CheckSIPPort( uint16_t );
 static void SIPFreeConfig(tSfPolicyUserContextId);
-static void _addPortsToStream5Filter(struct _SnortConfig *, SIPConfig *, tSfPolicyId);
+static void registerPortsForDispatch( struct _SnortConfig *sc, SIPConfig *policy );
+static void registerPortsForReassembly( SIPConfig *policy, int direction );
+static void _addPortsToStreamFilter(struct _SnortConfig *, SIPConfig *, tSfPolicyId);
 static void SIP_PrintStats(int);
+static void DisplaySIPStats (uint16_t type, void *old_context, struct _THREAD_ELEMENT *te, ControlDataSendFunc f);
 #ifdef TARGET_BASED
-static void _addServicesToStream5Filter(struct _SnortConfig *, tSfPolicyId);
+static void _addServicesToStreamFilter(struct _SnortConfig *, tSfPolicyId);
 #endif
 
 static void SIPCleanExit(int, void *);
@@ -112,12 +130,22 @@ SIPConfig *sip_eval_config;
 tSfPolicyUserContextId sip_config;
 
 #ifdef SNORT_RELOAD
+static APPDATA_ADJUSTER *ada;
+#endif
+
+static size_t SIP_NumSessions()
+{
+    return (size_t) numSessions;
+}
+
+#ifdef SNORT_RELOAD
 static void SIPReload(struct _SnortConfig *, char *, void **);
 static int SIPReloadVerify(struct _SnortConfig *, void *);
 static void * SIPReloadSwap(struct _SnortConfig *, void *);
 static void SIPReloadSwapFree(void *);
 #endif
 
+static SIPMsg sipMsg;
 
 /* Called at preprocessor setup time. Links preprocessor keyword
  * to corresponding preprocessor initialization function.
@@ -137,6 +165,9 @@ void SetupSIP(void)
     _dpd.registerPreproc("sip", SIPInit, SIPReload,
             SIPReloadVerify, SIPReloadSwap, SIPReloadSwapFree);
 #endif
+#ifdef DUMP_BUFFER
+    _dpd.registerBufferTracer(getSIPBuffers, SIP_BUFFER_DUMP_FUNC);
+#endif
 }
 
 SIPConfig *getParsingSIPConfig(struct _SnortConfig *sc)
@@ -151,6 +182,14 @@ SIPConfig *getParsingSIPConfig(struct _SnortConfig *sc)
         sip_parsing_config = sfPolicyUserDataGetCurrent(sip_config);
     return sip_parsing_config;
 }
+
+#ifdef REG_TEST
+static inline void PrintSIPSize(void)
+{
+    _dpd.logMsg("\nSIP Session Size: %lu\n", (long unsigned int)sizeof(SIPData));
+}
+#endif
+
 /* Initializes the SIP preprocessor module and registers
  * it in the preprocessor list.
  *
@@ -167,6 +206,11 @@ static void SIPInit(struct _SnortConfig *sc, char *argp)
     SIPConfig *pDefaultPolicyConfig = NULL;
     SIPConfig *pPolicyConfig = NULL;
 
+#ifdef REG_TEST
+    PrintSIPSize();
+#endif
+	/* For SFR CLI */
+	_dpd.controlSocketRegisterHandler(CS_TYPE_SIP_STATS, NULL, NULL, &DisplaySIPStats);
 
     if (sip_config == NULL)
     {
@@ -183,13 +227,16 @@ static void SIPInit(struct _SnortConfig *sc, char *argp)
         _dpd.addPreprocExit(SIPCleanExit, NULL, PRIORITY_LAST, PP_SIP);
 
 #ifdef PERF_PROFILING
-        _dpd.addPreprocProfileFunc("sip", (void *)&sipPerfStats, 0, _dpd.totalPerfStats);
+        _dpd.addPreprocProfileFunc("sip", (void *)&sipPerfStats, 0, _dpd.totalPerfStats, NULL);
 #endif
 
 #ifdef TARGET_BASED
         sip_app_id = _dpd.findProtocolReference("sip");
         if (sip_app_id == SFTARGET_UNKNOWN_PROTOCOL)
             sip_app_id = _dpd.addProtocolReference("sip");
+
+        // register with session to handle applications
+        _dpd.sessionAPI->register_service_handler( PP_SIP, sip_app_id );
 
 #endif
     }
@@ -211,28 +258,37 @@ static void SIPInit(struct _SnortConfig *sc, char *argp)
     }
 
     sfPolicyUserDataSetCurrent(sip_config, pPolicyConfig);
-
     SIP_RegRuleOptions(sc);
-
     ParseSIPArgs(pPolicyConfig, (u_char *)argp);
-
-    if (policy_id != 0)
-        pPolicyConfig->maxNumSessions = pDefaultPolicyConfig->maxNumSessions;
-    if ( pPolicyConfig->disabled )
-        return;
-    if (_dpd.streamAPI == NULL)
+#ifdef SNORT_RELOAD
+    pDefaultPolicyConfig = (SIPConfig *)sfPolicyUserDataGetDefault(sip_config);
+    //we don't know the order in which policies are init
+    //maybe default (policy 0) isn't init until after another policy is init
+    //however a default policy is guranteed
+    //avoid core
+    //Also, if SIP isn't enabled, then why waste memory?
+#ifdef REG_TEST
+    if (REG_TEST_FLAG_RELOAD & getRegTestFlags())
     {
-        DynamicPreprocessorFatalMessage("SetupSIP(): The Stream preprocessor must be enabled.\n");
+        printf("SIP-reload SIPInit-before : %p\n", ada);
     }
-
-    _dpd.addPreproc( sc, SIPmain, PRIORITY_APPLICATION, PP_SIP, PROTO_BIT__UDP|PROTO_BIT__TCP );
-
-    _addPortsToStream5Filter(sc, pPolicyConfig, policy_id);
-
-#ifdef TARGET_BASED
-    _addServicesToStream5Filter(sc, policy_id);
 #endif
+    if (pDefaultPolicyConfig != NULL && ada == NULL && SIPGlobalIsEnabled(sc, sip_config))
+    {
+        ada = ada_init(SIP_NumSessions, PP_SIP, (size_t)pDefaultPolicyConfig->maxNumSessions);
+        if (ada == NULL)
+            DynamicPreprocessorFatalMessage("Could not allocate memory for SIP ada\n");
+    }
+#ifdef REG_TEST
+    if (REG_TEST_FLAG_RELOAD & getRegTestFlags())
+    {
+        printf("SIP-reload SIPInit-after : %p\n", ada);
+    }
+#endif
+#endif
+
 }
+
 /*********************************************************************
  * Overload PCRE options: this is to support the "H"
  *
@@ -253,6 +309,8 @@ static inline void SIP_overloadURI(SFSnortPacket *p, SIPMsg *sipMsg)
     if ( sipMsg->body_data )
         _dpd.setHttpBuffer(HTTP_BUFFER_CLIENT_BODY, sipMsg->body_data, sipMsg->bodyLen);
 }
+
+
 /*********************************************************************
  * Main entry point for SIP processing.
  *
@@ -270,14 +328,15 @@ static inline int SIP_Process(SFSnortPacket *p, SIPData* sessp)
     char* sip_buff = (char*) p->payload;
     char* end;
     SIP_Roptions *pRopts;
-    SIPMsg sipMsg;
 
     memset(&sipMsg, 0, SIPMSG_ZERO_LEN);
+
 
     /*Input parameters*/
     sipMsg.isTcp = IsTCP(p);
 
     end =  sip_buff + p->payload_size;
+
 
     status = sip_parse(&sipMsg, sip_buff, end);
 
@@ -295,6 +354,7 @@ static inline int SIP_Process(SFSnortPacket *p, SIPData* sessp)
     pRopts->body_len = sipMsg.bodyLen;
     pRopts->body_data = sipMsg.body_data;
     pRopts->status_code = sipMsg.status_code;
+
 
     DEBUG_WRAP(DebugMessage(DEBUG_SIP, "SIP message header length: %d\n",
             sipMsg.headerLen));
@@ -331,7 +391,7 @@ static void SIPmain( void* ipacketp, void* contextp )
 #ifdef TARGET_BASED
     int16_t app_id = SFTARGET_UNKNOWN_PROTOCOL;
 #endif
-    tSfPolicyId policy_id = _dpd.getRuntimePolicy();
+    tSfPolicyId policy_id = _dpd.getNapRuntimePolicy();
     PROFILE_VARS;
 
     DEBUG_WRAP(DebugMessage(DEBUG_SIP, "%s\n", SIP_DEBUG__START_MSG));
@@ -343,15 +403,29 @@ static void SIPmain( void* ipacketp, void* contextp )
     assert((IsUDP(packetp) || IsTCP(packetp)) &&
         packetp->payload && packetp->payload_size);
 
-    if ( packetp->flags & FLAG_STREAM_INSERT )
-        return;
+    if (IsTCP(packetp))
+    {
+        if (!_dpd.readyForProcess(packetp))
+        {
+            /* Packet will be rebuilt, so wait for it */
+            DEBUG_WRAP(DebugMessage(DEBUG_SIP, "Packet will be reassembled\n"));
+            return;
+        }
+        if (_dpd.sessionAPI->get_application_data(packetp->stream_session, PP_SSL) &&
+            !_dpd.streamAPI->is_session_decrypted(packetp->stream_session))
+        {
+            /* Packet is a non-SIP/encrypted SIP one, skip those */
+            DEBUG_WRAP(DebugMessage(DEBUG_SIP, "Packet is encrypted or not a SIP packet\n"));
+            return;
+        }
+    }
 
     PREPROC_PROFILE_START(sipPerfStats);
 
     sip_eval_config = sfPolicyUserDataGetCurrent(sip_config);
 
     /* Attempt to get a previously allocated SIP block. */
-    sessp = _dpd.streamAPI->get_application_data(packetp->stream_session_ptr, PP_SIP);
+    sessp = _dpd.sessionAPI->get_application_data(packetp->stream_session, PP_SIP);
     if (sessp != NULL)
     {
         sip_eval_config = sfPolicyUserDataGet(sessp->config, sessp->policy_id);
@@ -364,7 +438,7 @@ static void SIPmain( void* ipacketp, void* contextp )
          * running on an SIP port, otherwise no need to examine the traffic.
          */
 #ifdef TARGET_BASED
-        app_id = _dpd.streamAPI->get_application_protocol_id(packetp->stream_session_ptr);
+        app_id = _dpd.sessionAPI->get_application_protocol_id(packetp->stream_session);
         if (app_id == SFTARGET_UNKNOWN_PROTOCOL)
         {
             DEBUG_WRAP(DebugMessage(DEBUG_SIP, "Unknown protocol - not inspecting.\n"));
@@ -428,10 +502,10 @@ static void SIPmain( void* ipacketp, void* contextp )
      * sure we don't do any more reassembly on this session */
     if (IsTCP(packetp))
     {
-        if ((_dpd.streamAPI->get_session_flags(packetp->stream_session_ptr) & SSNFLAG_MIDSTREAM)
-                || _dpd.streamAPI->missed_packets(packetp->stream_session_ptr, SSN_DIR_BOTH))
+        if ((_dpd.sessionAPI->get_session_flags(packetp->stream_session) & SSNFLAG_MIDSTREAM)
+                || _dpd.streamAPI->missed_packets(packetp->stream_session, SSN_DIR_BOTH))
         {
-            _dpd.streamAPI->set_reassembly(packetp->stream_session_ptr,
+            _dpd.streamAPI->set_reassembly(packetp->stream_session,
                     STREAM_FLPOLICY_IGNORE, SSN_DIR_BOTH,
                     STREAM_FLPOLICY_SET_ABSOLUTE);
 
@@ -443,13 +517,6 @@ static void SIPmain( void* ipacketp, void* contextp )
         }
     }
 
-    /* We're interested in this session. Turn on stream reassembly. */
-    if ( !(sessp->state_flags & SIP_FLG_REASSEMBLY_SET ))
-    {
-        _dpd.streamAPI->set_reassembly(packetp->stream_session_ptr,
-                STREAM_FLPOLICY_FOOTPRINT, SSN_DIR_BOTH, STREAM_FLPOLICY_SET_ABSOLUTE);
-        sessp->state_flags |= SIP_FLG_REASSEMBLY_SET;
-    }
     /*
      * Start process PAYLOAD
      */
@@ -479,7 +546,7 @@ SIPData * SIPGetNewSession(SFSnortPacket *packetp, tSfPolicyId policy_id)
     static int MaxSessionsAlerted = 0;
     /* Sanity check(s) */
     assert( packetp );
-    if ( !packetp->stream_session_ptr )
+    if ( !packetp->stream_session )
     {
         return NULL;
     }
@@ -500,9 +567,20 @@ SIPData * SIPGetNewSession(SFSnortPacket *packetp, tSfPolicyId policy_id)
         return NULL;
 
     /*Register the new SIP data block in the stream session. */
-    _dpd.streamAPI->set_application_data(
-            packetp->stream_session_ptr,
+    _dpd.sessionAPI->set_application_data(
+            packetp->stream_session,
             PP_SIP, datap, FreeSIPData );
+            
+    /* We're interested in this session. Turn on stream reassembly. */
+    if ( !(_dpd.streamAPI->get_reassembly_direction(packetp->stream_session) & SSN_DIR_BOTH ))
+    {
+        _dpd.streamAPI->set_reassembly(packetp->stream_session,
+                STREAM_FLPOLICY_FOOTPRINT, SSN_DIR_BOTH, STREAM_FLPOLICY_SET_ABSOLUTE);
+    }
+
+#ifdef SNORT_RELOAD
+    ada_add(ada, (void *)datap, packetp->stream_session);
+#endif
 
     datap->policy_id = policy_id;
     datap->config = sip_config;
@@ -536,6 +614,10 @@ static void FreeSIPData( void* idatap )
         return;
     if (numSessions > 0)
         numSessions--;
+
+#ifdef SNORT_RELOAD
+    ada_appdata_freed( ada, idatap );
+#endif
 
     /*Free all the dialog data*/
     sip_freeDialogs(&ssn->dialogs);
@@ -588,9 +670,42 @@ static inline int CheckSIPPort( uint16_t port )
     return SIP_FALSE;
 }
 
-static void _addPortsToStream5Filter(struct _SnortConfig *sc, SIPConfig *config, tSfPolicyId policy_id)
+static void registerPortsForDispatch( struct _SnortConfig *sc, SIPConfig *policy )
 {
-    int portNum;
+    if ( _dpd.isPreprocEnabled( sc, PP_APP_ID ) )
+    {
+        _dpd.sessionAPI->enable_preproc_all_ports( sc,
+                                                   PP_SIP,
+                                                   PROTO_BIT__UDP | PROTO_BIT__TCP ); 
+    }
+    else
+    {
+        int port;
+        for ( port = 0; port < MAXPORTS; port++ )
+        {
+            if( isPortEnabled( policy->ports, port ) )
+                _dpd.sessionAPI->enable_preproc_for_port( sc,
+                                                          PP_SIP,
+                                                          PROTO_BIT__UDP | PROTO_BIT__TCP,
+                                                          port ); 
+        }
+    }
+}
+
+static void registerPortsForReassembly( SIPConfig *policy, int direction )
+{
+    uint32_t port;
+
+    for ( port = 0; port < MAXPORTS; port++ )
+    {
+        if( isPortEnabled( policy->ports, port ) )
+            _dpd.streamAPI->register_reassembly_port( NULL, port, direction );
+    }
+}
+
+static void _addPortsToStreamFilter(struct _SnortConfig *sc, SIPConfig *config, tSfPolicyId policy_id)
+{
+    uint32_t portNum;
 
     assert(config);
     assert(_dpd.streamAPI);
@@ -602,33 +717,74 @@ static void _addPortsToStream5Filter(struct _SnortConfig *sc, SIPConfig *config,
             //Add port the port
             _dpd.streamAPI->set_port_filter_status(sc, IPPROTO_UDP, (uint16_t)portNum, PORT_MONITOR_SESSION, policy_id, 1);
             _dpd.streamAPI->set_port_filter_status(sc, IPPROTO_TCP, (uint16_t)portNum, PORT_MONITOR_SESSION, policy_id, 1);
+            register_sip_paf_port(sc, portNum, policy_id);
         }
     }
-
 }
+
 #ifdef TARGET_BASED
 
-static void _addServicesToStream5Filter(struct _SnortConfig *sc, tSfPolicyId policy_id)
+static void _addServicesToStreamFilter(struct _SnortConfig *sc, tSfPolicyId policy_id)
 {
     _dpd.streamAPI->set_service_filter_status(sc, sip_app_id, PORT_MONITOR_SESSION, policy_id, 1);
+    register_sip_paf_service(sc, sip_app_id, policy_id);
 }
 #endif
-static int SIPCheckPolicyConfig(struct _SnortConfig *sc, tSfPolicyUserContextId config, tSfPolicyId policyId, void* pData)
+
+static int SIPCheckPolicyConfig(struct _SnortConfig *sc, tSfPolicyUserContextId config, tSfPolicyId policy_id, void* pData)
 {
-    SIPConfig *pPolicyConfig = (SIPConfig *)pData;
+    SIPConfig *sip_policy = ( SIPConfig * ) pData;
 
-    _dpd.setParserPolicy(sc, policyId);
-
-    if (pPolicyConfig->disabled)
+    if ( sip_policy->disabled )
         return 0;
 
-    if (!_dpd.isPreprocEnabled(sc, PP_STREAM5))
+    if (!_dpd.isPreprocEnabled(sc, PP_STREAM))
     {
         _dpd.errMsg("SIPCheckPolicyConfig(): The Stream preprocessor must be enabled.\n");
         return -1;
     }
+
+    if (policy_id != 0)
+    {
+        SIPConfig *default_sip_policy = ( SIPConfig * ) sfPolicyUserDataGetDefault( config );
+        if(default_sip_policy == NULL)
+        {
+            _dpd.errMsg("SIPCheckPolicyConfig(): SIP default policy must be configured\n");
+            return -1;
+        }
+
+        sip_policy->maxNumSessions = default_sip_policy->maxNumSessions;
+     }
+    
+    _dpd.setParserPolicy( sc, policy_id );
+    _dpd.addPreproc( sc, SIPmain, PRIORITY_APPLICATION, PP_SIP, PROTO_BIT__UDP|PROTO_BIT__TCP );
+
+    // register ports with session and stream
+    registerPortsForDispatch( sc, sip_policy );
+    registerPortsForReassembly( sip_policy, SSN_DIR_FROM_SERVER | SSN_DIR_FROM_CLIENT );
+    _addPortsToStreamFilter(sc, sip_policy, policy_id);
+
+#ifdef TARGET_BASED
+    _addServicesToStreamFilter(sc, policy_id);
+#endif
+
     return 0;
 }
+
+static bool SIPGlobalIsEnabled(struct _SnortConfig *sc, tSfPolicyUserContextId config)
+{
+   return sfPolicyUserDataIterate(sc, config, SIPPolicyIsEnabled) != 0;
+}
+
+static int SIPPolicyIsEnabled(struct _SnortConfig *sc, tSfPolicyUserContextId pContext, tSfPolicyId policyId, void* config)
+{
+    SIPConfig *sip_policy_config = (SIPConfig *) config;
+    if (sip_policy_config == NULL || sip_policy_config->disabled)
+        return 0;
+
+    return 1;
+}
+
 int SIPCheckConfig(struct _SnortConfig *sc)
 {
     int rval;
@@ -639,13 +795,16 @@ int SIPCheckConfig(struct _SnortConfig *sc)
     return 0;
 }
 
-
 static void SIPCleanExit(int signal, void *data)
 {
     if (sip_config != NULL)
     {
         SIPFreeConfig(sip_config);
         sip_config = NULL;
+#ifdef SNORT_RELOAD
+        ada_delete(ada);
+        ada = NULL;
+#endif
     }
 }
 static int SIPFreeConfigPolicy(
@@ -672,6 +831,43 @@ void SIPFreeConfig(tSfPolicyUserContextId config)
     sfPolicyUserDataFreeIterate (config, SIPFreeConfigPolicy);
     sfPolicyConfigDelete(config);
 }
+
+static void DisplaySIPStats (uint16_t type, void *old_context, struct _THREAD_ELEMENT *te, ControlDataSendFunc f)
+{
+    char buffer[CS_STATS_BUF_SIZE + 1];
+    int i = 0;
+    int len = 0;
+
+    if (sip_stats.sessions) {
+        len += snprintf(buffer, CS_STATS_BUF_SIZE,  "SIP Preprocessor Statistics\n"
+            "  Total sessions: "STDu64"\n", sip_stats.sessions);
+        if (sip_stats.events)
+            len += snprintf(buffer+len, CS_STATS_BUF_SIZE-len,  "  SIP anomalies : "STDu64"\n", sip_stats.events);
+
+        if (sip_stats.dialogs)
+            len += snprintf(buffer+len, CS_STATS_BUF_SIZE-len,  "  Total  dialogs: "STDu64"\n", sip_stats.dialogs);
+
+        len += snprintf(buffer+len, CS_STATS_BUF_SIZE-len,  "  Requests: "STDu64"\n", sip_stats.requests[0]);
+        while (NULL != StandardMethods[i].name && len < CS_STATS_BUF_SIZE) {
+            len += snprintf(buffer+len, CS_STATS_BUF_SIZE-len,  "%16s:   "STDu64"\n",
+                    StandardMethods[i].name, sip_stats.requests[StandardMethods[i].methodFlag]);
+            i++;
+        }
+        len += snprintf(buffer+len, CS_STATS_BUF_SIZE-len,  "  Responses: "STDu64"\n", sip_stats.responses[TOTAL_RESPONSES]);
+        for (i = 1; i <NUM_OF_RESPONSE_TYPES && len < CS_STATS_BUF_SIZE; i++) {
+            len += snprintf(buffer+len, CS_STATS_BUF_SIZE-len,  "             %dxx:   "STDu64"\n", i, sip_stats.responses[i]);
+        }
+        len += snprintf(buffer+len, CS_STATS_BUF_SIZE-len,  " Ignore sessions:   "STDu64"\n"
+            " Ignore channels:   "STDu64"\n", sip_stats.ignoreSessions, sip_stats.ignoreChannels);
+    } else {
+        len = snprintf(buffer, CS_STATS_BUF_SIZE, "SIP Stats not available\n Total Sessions:"STDu64"\n", sip_stats.sessions );
+    }
+
+    if (-1 == f(te, (const uint8_t *)buffer, len)) {
+        _dpd.logMsg("Unable to send data to the frontend\n");
+    }
+}
+
 /******************************************************************
  * Print statistics being kept by the preprocessor.
  *
@@ -717,6 +913,7 @@ static void SIPReload(struct _SnortConfig *sc, char *args, void **new_config)
 {
     tSfPolicyUserContextId sip_swap_config = (tSfPolicyUserContextId)*new_config;
     tSfPolicyId policy_id = _dpd.getParserPolicy(sc);
+    SIPConfig *pDefaultPolicyConfig = NULL;
     SIPConfig * pPolicyConfig = NULL;
 
     if (sip_swap_config == NULL)
@@ -725,8 +922,7 @@ static void SIPReload(struct _SnortConfig *sc, char *args, void **new_config)
         sip_swap_config = sfPolicyConfigCreate();
         if (sip_swap_config == NULL)
         {
-            DynamicPreprocessorFatalMessage("Failed to allocate memory "
-                    "for SIP config.\n");
+            DynamicPreprocessorFatalMessage("Failed to allocate memory for SIP config.\n");
         }
         *new_config = (void *)sip_swap_config;
     }
@@ -735,8 +931,7 @@ static void SIPReload(struct _SnortConfig *sc, char *args, void **new_config)
     pPolicyConfig = (SIPConfig *)sfPolicyUserDataGetCurrent(sip_swap_config);
     if (pPolicyConfig != NULL)
     {
-        DynamicPreprocessorFatalMessage("SIP preprocessor can only be "
-                "configured once.\n");
+        DynamicPreprocessorFatalMessage("SIP preprocessor can only be configured once.\n");
     }
 
     pPolicyConfig = (SIPConfig *)calloc(1, sizeof(SIPConfig));
@@ -746,67 +941,73 @@ static void SIPReload(struct _SnortConfig *sc, char *args, void **new_config)
                 "SIP preprocessor configuration.\n");
     }
     sfPolicyUserDataSetCurrent(sip_swap_config, pPolicyConfig);
-
     SIP_RegRuleOptions(sc);
-
     ParseSIPArgs(pPolicyConfig, (u_char *)args);
 
-    if( pPolicyConfig->disabled )
-        return;
-
-    if (_dpd.streamAPI == NULL)
+    pDefaultPolicyConfig = (SIPConfig *)sfPolicyUserDataGetDefault(sip_config);
+    //we don't know the order in which policies are init
+    //maybe default (policy 0) isn't init until after another policy is init
+    //however a default policy is guranteed
+    //avoid core
+    //Also, if SIP isn't enabled, then why waste memory?
+#ifdef REG_TEST
+    if (REG_TEST_FLAG_RELOAD & getRegTestFlags())
     {
-        DynamicPreprocessorFatalMessage("SetupSIP(): The Stream preprocessor must be enabled.\n");
+        printf("SIP-reload SIPReload-before : %p\n", ada);
     }
-
-    _dpd.addPreproc( sc, SIPmain, PRIORITY_APPLICATION, PP_SIP, PROTO_BIT__UDP|PROTO_BIT__TCP );
-
-    _addPortsToStream5Filter(sc, pPolicyConfig, policy_id);
-
-#ifdef TARGET_BASED
-    _addServicesToStream5Filter(sc, policy_id);
+#endif
+    if (pDefaultPolicyConfig != NULL && SIPGlobalIsEnabled(sc, sip_swap_config) && ada == NULL)
+    {
+        ada = ada_init(SIP_NumSessions, PP_SIP, (size_t)pDefaultPolicyConfig->maxNumSessions);
+        if (ada == NULL)
+            DynamicPreprocessorFatalMessage("Could not allocate memory for SIP ada\n");
+    }
+#ifdef REG_TEST
+    if (REG_TEST_FLAG_RELOAD & getRegTestFlags())
+    {
+        printf("SIP-reload SIPReload-after : %p\n", ada);
+    }
 #endif
 }
 
 static int SIPReloadVerify(struct _SnortConfig *sc, void *swap_config)
 {
     tSfPolicyUserContextId sip_swap_config = (tSfPolicyUserContextId)swap_config;
-    SIPConfig * pPolicyConfig = NULL;
-    SIPConfig * pCurrentConfig = NULL;
+    SIPConfig * default_swap_config = NULL;
+    SIPConfig * current_default_config = NULL;
+    int rval;
 
     if (sip_swap_config == NULL)
         return 0;
 
-    pPolicyConfig = (SIPConfig *)sfPolicyUserDataGet(sip_swap_config, _dpd.getDefaultPolicy());
+    // validate each policy and do per policy initialization processing
+    if ((rval = sfPolicyUserDataIterate (sc, sip_swap_config, SIPCheckPolicyConfig)))
+        return rval;
 
-    if (!pPolicyConfig)
-        return 0;
-
-    if ( pPolicyConfig->disabled )
-        return 0;
-
-    if (!_dpd.isPreprocEnabled(sc, PP_STREAM5))
-    {
-        _dpd.errMsg("SetupSIP(): The Stream preprocessor must be enabled.\n");
-        return -1;
-    }
+    default_swap_config = (SIPConfig *)sfPolicyUserDataGet(sip_swap_config, _dpd.getDefaultPolicy());
 
     if (sip_config != NULL)
     {
-        pCurrentConfig = (SIPConfig *)sfPolicyUserDataGet(sip_config, _dpd.getDefaultPolicy());
+        current_default_config = (SIPConfig *)sfPolicyUserDataGet(sip_config, _dpd.getDefaultPolicy());
+        //not possible
+        if (!current_default_config)
+            return 0;
+
+        tSfPolicyId policy_id = _dpd.getParserPolicy(sc);
+        if (!SIPGlobalIsEnabled(sc, sip_swap_config))
+        {
+            ada_reload_disable(&ada, sc, "sip-disable-mem-dump", policy_id);
+        }
+        else if (SIPGlobalIsEnabled(sc, sip_config) && default_swap_config->maxNumSessions < current_default_config->maxNumSessions)
+        {
+            ada_reload_adjust_register(ada, policy_id, sc, "sip-mem-reloader",
+                    (size_t) default_swap_config->maxNumSessions);
+        }
     }
 
-    if (!pCurrentConfig)
-        return 0;
-
-    if (pPolicyConfig->maxNumSessions != pCurrentConfig->maxNumSessions)
-    {
-        _dpd.errMsg("SIP reload: Changing the max_sessions requires a restart.\n");
-        return -1;
-    }
-
-    return 0;
+   return 0;
 }
+
 static int SIPFreeUnusedConfigPolicy(
         tSfPolicyUserContextId config,
         tSfPolicyId policyId,
@@ -831,11 +1032,10 @@ static void * SIPReloadSwap(struct _SnortConfig *sc, void *swap_config)
 
     if (sip_swap_config == NULL)
         return NULL;
-
+        
     sip_config = sip_swap_config;
 
     sfPolicyUserDataFreeIterate (old_config, SIPFreeUnusedConfigPolicy);
-
     if (sfPolicyUserPolicyGetActive(old_config) == 0)
     {
         /* No more outstanding configs - free the config array */

@@ -1,8 +1,8 @@
 /*
- ** Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+ ** Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
  ** Copyright (C) 1998-2013 Sourcefire, Inc.
  **
- ** Writen by Bhagyashree Bantwal <bbantwal@sourcefire.com>
+ ** Writen by Bhagyashree Bantwal <bbantwal@cisco.com>
  **
  ** This program is free software; you can redistribute it and/or modify
  ** it under the terms of the GNU General Public License Version 2 as
@@ -27,6 +27,8 @@
 #include "util_unfold.h"
 #include "sf_base64decode.h"
 #include "snort_bounds.h"
+#include "file_mail_common.h"
+#include "file_api.h"
 
 #define MAX_BUF 65535
 #define DECODE_SUCCESS  0
@@ -92,9 +94,15 @@ typedef struct s_Email_DecodeState
     BitEnc_DecodeState bitenc_state;
 
 } Email_DecodeState;
+typedef struct _MimeStats
+{
+    uint64_t memcap_exceeded;
+    uint64_t attachments[DECODE_ALL];
+    uint64_t decoded_bytes[DECODE_ALL];
+} MimeStats;
 
 // end :: start + length
-int EmailDecode(const uint8_t *start, const uint8_t *end, Email_DecodeState *);
+int EmailDecode(const uint8_t *start, const uint8_t *end, Email_DecodeState *, uint8_t *fname, uint32_t *fname_size, bool filename_present);
 
 
 static inline int getCodeDepth(int code_depth, int64_t file_depth)

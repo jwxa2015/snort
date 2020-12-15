@@ -16,6 +16,7 @@ PROBLEMS \
 README \
 README.active \
 README.alert_order \
+README.appid OpenDetectorDeveloperGuide.pdf \
 README.asn1 \
 README.counts \
 README.csv \
@@ -49,7 +50,6 @@ README.pop \
 README.ppm \
 README.reload \
 README.reputation \
-README.rzb_saac \
 README.sensitive_data \
 README.sfportscan \
 README.SMTP \
@@ -74,7 +74,11 @@ docdir = ${datadir}/doc/${PACKAGE}
 SUFFIXES = .tex .dvi .ps
 
 .tex.dvi:
-	pslatex $< && pslatex $< && pslatex $<
+	if [ -f /etc/centos-release ]; then \
+		latex $< && latex $< && latex $<; \
+	else \
+		pslatex $< && pslatex $< && pslatex $<; \
+	fi
 
 .dvi.ps:
 	dvips $< -o

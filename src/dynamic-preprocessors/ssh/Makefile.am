@@ -3,9 +3,9 @@ AUTOMAKE_OPTIONS=foreign no-dependencies
 
 INCLUDES = -I../include -I${srcdir}/../libs
 
-libdir = ${exec_prefix}/lib/snort_dynamicpreprocessor
+dynamicpreprocessordir = ${libdir}/snort_dynamicpreprocessor
 
-lib_LTLIBRARIES = libsf_ssh_preproc.la
+dynamicpreprocessor_LTLIBRARIES = libsf_ssh_preproc.la
 
 libsf_ssh_preproc_la_LDFLAGS = -export-dynamic -module @XCCFLAGS@
 if SO_WITH_STATIC_LIB
@@ -20,9 +20,16 @@ libsf_ssh_preproc_la_SOURCES = \
 spp_ssh.c \
 spp_ssh.h
 
+if BUILD_BUFFER_DUMP
+libsf_ssh_preproc_la_SOURCES += \
+ssh_buffer_dump.c \
+ssh_buffer_dump.h
+endif
+
 EXTRA_DIST = \
+sf_ssh.vcxproj \
 sf_ssh.dsp
 
 all-local: $(LTLIBRARIES)
-	$(MAKE) DESTDIR=`pwd`/../build install-libLTLIBRARIES
+	$(MAKE) DESTDIR=`pwd`/../build install-dynamicpreprocessorLTLIBRARIES
 

@@ -1,6 +1,6 @@
 /* $Id$ */
 /*
-** Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+** Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
 ** Copyright (C) 2002-2013 Sourcefire, Inc.
 ** Copyright (C) 2002 Martin Roesch <roesch@sourcefire.com>
 **
@@ -50,6 +50,7 @@
 #include "sflsq.h"
 #include "sfutil/sf_ipvar.h"
 #include "ipv6_port.h"
+#include "control/sfcontrol.h"
 
 /* Macros *********************************************************************/
 
@@ -176,6 +177,8 @@ void SetUidGid(int, int);
 void InitGroups(int, int);
 void SetChroot(char *, char **);
 void DropStats(int);
+/* Function For Displaying in SFR CLI */
+void DisplayActionStats (uint16_t type, void *old_context, struct _THREAD_ELEMENT *te, ControlDataSendFunc f);
 void TimeStart(void);
 void TimeStop(void);
 
@@ -191,8 +194,11 @@ typedef struct _ThrottleInfo
     /*Within this duration (in seconds), maximal one distinct message is logged*/
     uint32_t duration_to_log;
     uint64_t count;
+    /*Till the message count reaches to count_to_log, maximal one distinct message is logged*/
+    uint64_t count_to_log;
 }ThrottleInfo;
 void ErrorMessageThrottled(ThrottleInfo*,const char *, ...) __attribute__((format (printf, 2, 3)));
+void LogThrottledByTimeCount(ThrottleInfo*,const char *, ...) __attribute__((format (printf, 2, 3)));
 
 NORETURN void FatalError(const char *, ...) __attribute__((format (printf, 1, 2)));
 NORETURN void SnortFatalExit(void);
@@ -215,7 +221,7 @@ char *GetAbsolutePath(char *dir);
 char *StripPrefixDir(char *prefix, char *dir);
 void PrintPacketData(const uint8_t *, const uint32_t);
 
-char * ObfuscateIpToText(sfip_t *);
+char * ObfuscateIpToText(sfaddr_t *);
 
 #ifndef WIN32
 SF_LIST * SortDirectory(const char *);
@@ -233,6 +239,18 @@ char *fasthex(const u_char *, int);
 int xatol(const char *, const char *);
 unsigned int xatou(const char *, const char *);
 unsigned int xatoup(const char *, const char *); // return > 0
+
+static inline void* SnortMalloc (unsigned long size)
+{
+    void* pv = malloc(size);
+
+    if ( pv )
+        return pv;
+
+    FatalError("Unable to allocate memory!  (%lu requested)\n", size);
+
+    return NULL;
+}
 
 static inline void* SnortAlloc (unsigned long size)
 {
@@ -359,6 +377,7 @@ static inline int IsEmptyStr(const char *str)
     return 0;
 }
 
+#ifndef HAVE_GETTID
 static inline pid_t gettid(void)
 {
 #if defined(LINUX) && defined(SYS_gettid)
@@ -367,5 +386,6 @@ static inline pid_t gettid(void)
     return getpid();
 #endif
 }
+#endif
 
 #endif /*__UTIL_H__*/

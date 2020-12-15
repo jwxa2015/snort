@@ -1,6 +1,6 @@
 /* $Id$ */
 /*
-** Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+** Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
 ** Copyright (C) 2002-2013 Sourcefire, Inc.
 ** Copyright (C) 1998-2002 Martin Roesch <roesch@sourcefire.com>
 **
@@ -33,7 +33,7 @@
 #include <wchar.h>
 #endif
 
-// this env var uses the lower 32 bits of the flags:
+/* this env var uses the lower 32 bits of the flags: */
 #define DEBUG_VARIABLE "SNORT_DEBUG"
 
 #define DEBUG_INIT            0x0000000000000001LL
@@ -56,7 +56,7 @@
 #define DEBUG_CONTROL         0x0000000000020000LL
 #define DEBUG_EXP             0x0000000080000000LL
 
-// this env var uses the upper 32 bits of the flags:
+/* this env var uses the upper 32 bits of the flags: */
 #define DEBUG_PP_VAR   "SNORT_PP_DEBUG"
 
 #define DEBUG_FRAG            0x0000000100000000LL
@@ -76,11 +76,12 @@
 #define DEBUG_SKYPE           0x0000400000000000LL
 #define DEBUG_SSL             0x0000800000000000LL
 #define DEBUG_SMTP            0x0001000000000000LL
+#define DEBUG_APPID           0x0002000000000000LL
 #define DEBUG_PP_EXP          0x8000000000000000LL
 
-void DebugMessageFunc(uint64_t dbg,char *fmt, ...);
+void DebugMessageFunc(uint64_t dbg, const char *fmt, ...);
 #ifdef SF_WCHAR
-void DebugWideMessageFunc(uint64_t dbg,wchar_t *fmt, ...);
+void DebugWideMessageFunc(uint64_t dbg, const wchar_t *fmt, ...);
 #endif
 
 #ifdef DEBUG_MSGS
@@ -105,9 +106,9 @@ void DebugWideMessageFunc(uint64_t dbg,wchar_t *fmt, ...);
 
 #ifdef DEBUG_MSGS
 #define DEBUG_WRAP(code) code
-void DebugMessageFunc(uint64_t dbg,char *fmt, ...);
+void DebugMessageFunc(uint64_t dbg, const char *fmt, ...);
 #ifdef SF_WCHAR
-void DebugWideMessageFunc(uint64_t dbg,wchar_t *fmt, ...);
+void DebugWideMessageFunc(uint64_t dbg, const wchar_t *fmt, ...);
 #endif
 #else /* DEBUG_MSGS */
 #define DEBUG_WRAP(code)

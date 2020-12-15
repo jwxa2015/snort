@@ -21,6 +21,7 @@ encode.c encode.h \
 active.c active.h \
 log.c log.h \
 mstring.c mstring.h \
+hashstring.c hashstring.h \
 parser.c parser.h \
 profiler.c profiler.h \
 plugbase.c plugbase.h \
@@ -57,10 +58,15 @@ log_text.c log_text.h \
 detection_filter.c detection_filter.h \
 detection_util.c detection_util.h \
 rate_filter.c rate_filter.h \
+pkt_tracer.c pkt_tracer.h \
 obfuscation.c obfuscation.h \
 rule_option_types.h \
 sfdaq.c sfdaq.h \
-idle_processing.c idle_processing.h idle_processing_funcs.h
+reload.c reload.h reload_api.h \
+idle_processing.c idle_processing.h idle_processing_funcs.h \
+appIdApi.h \
+reg_test.h reg_test.c \
+memory_stats.h memory_stats.c
 
 if BUILD_CONTROL_SOCKET
 snort_SOURCES += dump.c dump.h
@@ -74,7 +80,8 @@ preprocessors/libspp.a                \
 parser/libparser.a \
 target-based/libtarget_based.a \
 preprocessors/HttpInspect/libhttp_inspect.a \
-preprocessors/Stream5/libstream5.a \
+preprocessors/Session/libsession.a \
+preprocessors/Stream6/libstream6.a \
 sfutil/libsfutil.a \
 control/libsfcontrol.a \
 file-process/libfileAPI.a \
@@ -94,4 +101,9 @@ snort_LDADD += \
 side-channel/libsidechannel.a \
 side-channel/plugins/libsscm.a
 SUBDIRS += side-channel
+endif
+
+if BUILD_SNORT_RELOAD
+snort_LDADD += reload-adjust/libreload_adjust.a
+SUBDIRS += reload-adjust
 endif

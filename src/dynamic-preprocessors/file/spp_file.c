@@ -1,7 +1,7 @@
 /* $Id */
 
 /*
- ** Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+ ** Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
  ** Copyright (C) 2013-2013 Sourcefire, Inc.
  **
  **
@@ -164,8 +164,8 @@ static void FileInit(struct _SnortConfig *sc, char *argp)
 
     file_config_parse(pPolicyConfig, (u_char *)argp);
     FileUpdateConfig(pPolicyConfig, file_config);
-
-    file_agent_init(pPolicyConfig);
+    file_agent_init(sc, pPolicyConfig);
+    _dpd.addPostConfigFunc(sc, file_agent_thread_init, pPolicyConfig);
 
 }
 
@@ -230,7 +230,7 @@ static int FileCheckPolicyConfig(struct _SnortConfig *sc,
 {
     _dpd.setParserPolicy(sc, policyId);
 
-    if (!_dpd.isPreprocEnabled(sc, PP_STREAM5))
+    if (!_dpd.isPreprocEnabled(sc, PP_STREAM))
     {
         DynamicPreprocessorFatalMessage("FileCheckPolicyConfig(): The Stream preprocessor must be enabled.\n");
     }
@@ -299,7 +299,7 @@ static void FileReload(struct _SnortConfig *sc, char *args, void **new_config)
 
     file_config_parse(pPolicyConfig, (u_char *)args);
     FileUpdateConfig(pPolicyConfig, file_config);
-
+    file_agent_init(sc, pPolicyConfig);
 }
 
 static int FileReloadVerify(struct _SnortConfig *sc, void *swap_config)
@@ -331,7 +331,7 @@ static int FileReloadVerify(struct _SnortConfig *sc, void *swap_config)
         return -1;
     }
 
-    if (!_dpd.isPreprocEnabled(sc, PP_STREAM5))
+    if (!_dpd.isPreprocEnabled(sc, PP_STREAM))
     {
         _dpd.errMsg("SetupFile(): The Stream preprocessor must be enabled.\n");
         return -1;

@@ -1,5 +1,5 @@
 /****************************************************************************
- * Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+ * Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
  * Copyright (C) 2008-2013 Sourcefire, Inc.
  *
  * This program is free software; you can redistribute it and/or modify
@@ -58,6 +58,10 @@ DCE2_ProtoIds dce2_proto_ids;
 static SFSnortPacket* dce2_rpkt[DCE2_RPKT_TYPE__MAX] = {
     NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
 };
+
+#ifdef SNORT_RELOAD
+APPDATA_ADJUSTER *ada;
+#endif
 
 static int dce2_detected = 0;
 
@@ -151,8 +155,12 @@ static DCE2_SsnData * DCE2_NewSession(SFSnortPacket *p, tSfPolicyId policy_id)
     }
 
     DCE2_SsnSetAppData(p, (void *)sd, DCE2_SsnFree);
+#ifdef SNORT_RELOAD
+    ada_add( ada, (void *) sd, p->stream_session );
+#endif
 
     dce2_stats.sessions++;
+    dce2_stats.sessions_active++;
     DEBUG_WRAP(DCE2_DebugMsg(DCE2_DEBUG__MAIN, "Created (%p)\n", (void *)sd));
 
     sd->trans = trans;
@@ -233,7 +241,7 @@ static DCE2_SsnData * DCE2_NewSession(SFSnortPacket *p, tSfPolicyId policy_id)
  *********************************************************************/
 DCE2_Ret DCE2_Process(SFSnortPacket *p)
 {
-    tSfPolicyId policy_id = _dpd.getRuntimePolicy();
+    tSfPolicyId policy_id = _dpd.getNapRuntimePolicy();
     DCE2_SsnData *sd = (DCE2_SsnData *)DCE2_SsnGetAppData(p);
     PROFILE_VARS;
 
@@ -593,9 +601,9 @@ static DCE2_TransType DCE2_GetTransport(SFSnortPacket *p, const DCE2_ServerConfi
     *autodetected = 0;
 
 #ifdef TARGET_BASED
-    if (_dpd.isAdaptiveConfigured(_dpd.getRuntimePolicy()))
+    if (_dpd.isAdaptiveConfigured())
     {
-        proto_id = _dpd.streamAPI->get_application_protocol_id(p->stream_session_ptr);
+        proto_id = _dpd.sessionAPI->get_application_protocol_id(p->stream_session);
 
         if (proto_id == SFTARGET_UNKNOWN_PROTOCOL)
             return DCE2_TRANS_TYPE__NONE;
@@ -929,7 +937,7 @@ SFSnortPacket * DCE2_GetRpkt(const SFSnortPacket *wire_pkt, DCE2_RpktType rpkt_t
         rpkt->flags |= FLAG_FROM_CLIENT;
     else
         rpkt->flags |= FLAG_FROM_SERVER;
-    rpkt->stream_session_ptr = wire_pkt->stream_session_ptr;
+    rpkt->stream_session = wire_pkt->stream_session;
 
     return rpkt;
 }
@@ -1294,6 +1302,7 @@ static void DCE2_SsnFree(void *data)
         return;
 
 #ifdef SNORT_RELOAD
+    ada_appdata_freed( ada, data );
     config = sd->config;
     policy_id = sd->policy_id;
 #endif
@@ -1342,5 +1351,6 @@ static void DCE2_SsnFree(void *data)
         }
     }
 #endif
+    dce2_stats.sessions_active--;
 }
 

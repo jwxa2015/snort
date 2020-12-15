@@ -1,5 +1,5 @@
 /*
-** Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+** Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
 ** Copyright (C) 2005-2013 Sourcefire, Inc.
 ** Copyright (C) 1998-2005 Martin Roesch <roesch@sourcefire.com>
 **
@@ -142,6 +142,7 @@
 #include "sf_types.h"
 #include "sfPolicy.h"
 #include "sfPolicyUserData.h"
+#include "session_api.h"
 
 #define BACKORIFICE_DEFAULT_KEY   31337
 #define BACKORIFICE_MAGIC_SIZE    8
@@ -258,7 +259,7 @@ static void BoInit(struct _SnortConfig *sc, char *args)
         AddFuncToPreprocCleanExitList(BoCleanExit, NULL, PRIORITY_LAST, PP_BO);
 
 #ifdef PERF_PROFILING
-        RegisterPreprocessorProfile("backorifice", &boPerfStats, 0, &totalPerfStats);
+        RegisterPreprocessorProfile("backorifice", &boPerfStats, 0, &totalPerfStats, NULL);
 #endif
     }
 
@@ -281,7 +282,8 @@ static void BoInit(struct _SnortConfig *sc, char *args)
     ProcessArgs(pPolicyConfig, args);
 
     /* Set the preprocessor function into the function list */
-    AddFuncToPreprocList(sc, BoFind, PRIORITY_LAST, PP_BO, PROTO_BIT__UDP);
+    AddFuncToPreprocList(sc, BoFind, PRIORITY_APPLICATION, PP_BO, PROTO_BIT__UDP);
+    session_api->enable_preproc_all_ports( sc, PP_BO, PROTO_BIT__UDP );
 }
 
 
@@ -552,10 +554,11 @@ static void BoFind(Packet *p, void *context)
     char plaintext;
     int i;
     int bo_direction = 0;
+    uint32_t sid = 0;
     BoConfig *bo = NULL;
     PROFILE_VARS;
 
-    sfPolicyUserPolicySet (bo_config, getRuntimePolicy());
+    sfPolicyUserPolicySet (bo_config, getNapRuntimePolicy());
     bo = (BoConfig *)sfPolicyUserDataGetCurrent(bo_config);
 
     /* Not configured in this policy */
@@ -640,6 +643,7 @@ static void BoFind(Packet *p, void *context)
                 if ( (bo->drop_flags & BO_ALERT_CLIENT) )
                 {
                     Active_DropSession(p);
+                    sid = BO_CLIENT_TRAFFIC_DETECT;
                 }
                 DEBUG_WRAP(DebugMessage(DEBUG_PLUGIN, "Client packet\n"););
             }
@@ -653,6 +657,7 @@ static void BoFind(Packet *p, void *context)
                 if ( (bo->drop_flags & BO_ALERT_SERVER) )
                 {
                     Active_DropSession(p);
+                    sid = BO_SERVER_TRAFFIC_DETECT;
                 }
                 DEBUG_WRAP(DebugMessage(DEBUG_PLUGIN, "Server packet\n"););
             }
@@ -666,9 +671,17 @@ static void BoFind(Packet *p, void *context)
                 if ( (bo->drop_flags & BO_ALERT_GENERAL) )
                 {
                     Active_DropSession(p);
+                    sid = BO_TRAFFIC_DETECT;
                 }
             }
         }
+    }
+    if (Active_PacketWasDropped() || Active_PacketWouldBeDropped())
+    {
+        if (pkt_trace_enabled)
+            addPktTraceData(VERDICT_REASON_BO, snprintf(trace_line, MAX_TRACE_LINE,
+                "Back Orifice: gid %u, sid %u, %s\n", GENERATOR_SPP_BO, sid, getPktTraceActMsg()));
+        else addPktTraceData(VERDICT_REASON_BO, 0);
     }
 
     PREPROC_PROFILE_END(boPerfStats);
@@ -898,6 +911,7 @@ static void BoReload(struct _SnortConfig *sc, char *args, void **new_config)
     ProcessArgs(pPolicyConfig, args);
 
     AddFuncToPreprocList(sc, BoFind, PRIORITY_LAST, PP_BO, PROTO_BIT__UDP);
+    session_api->enable_preproc_all_ports( sc, PP_BO, PROTO_BIT__UDP );
 }
 
 static void * BoReloadSwap(struct _SnortConfig *sc, void *swap_config)

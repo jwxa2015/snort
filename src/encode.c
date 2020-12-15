@@ -1,7 +1,7 @@
 /* $Id$ */
 /****************************************************************************
  *
- * Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+ * Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
  * Copyright (C) 2005-2013 Sourcefire, Inc.
  *
  * This program is free software; you can redistribute it and/or modify
@@ -40,8 +40,13 @@
 #include "sfdaq.h"
 #include "sf_iph.h"
 #include "snort.h"
+#include "session_api.h"
 #include "stream_api.h"
 #include "checksum.h"
+
+#ifdef MPLS
+#include "preprocessors/Session/session_common.h"
+#endif
 
 #define GET_IP_HDR_LEN(h) (((h)->ip_verhl & 0x0f) << 2)
 #define GET_TCP_HDR_LEN(h) (((h)->th_offx2 & 0xf0) >> 2)
@@ -56,12 +61,6 @@
 static uint8_t* dst_mac = NULL;
 Packet* encode_pkt = NULL;
 uint64_t total_rebuilt_pkts = 0;
-
-static inline int IsIcmp (int type)
-{
-    static int s_icmp[ENC_MAX] = { 0, 0, 1, 1, 1 };
-    return ( s_icmp[type] );
-}
 
 //-------------------------------------------------------------------------
 // encoders operate layer by layer:
@@ -263,10 +262,35 @@ int Encode_Format (EncodeFlags f, const Packet* p, Packet* c, PseudoPacketType t
     pkth->egress_index = phdr->egress_index;
     pkth->egress_group = phdr->egress_group;
     pkth->flags = phdr->flags & (~DAQ_PKT_FLAG_HW_TCP_CS_GOOD);
+#if !defined(SFLINUX) && defined(DAQ_CAPA_VRF)
+    pkth->address_space_id_src = phdr->address_space_id_src;
+    pkth->address_space_id_dst = phdr->address_space_id_dst;
+#else
     pkth->address_space_id = phdr->address_space_id;
+#endif
+#if !defined(SFLINUX) && defined(DAQ_CAPA_CARRIER_ID)
+    pkth->carrier_id = phdr->carrier_id;
+#endif
     pkth->opaque = opaque;
+    if( type == PSEUDO_PKT_TCP || type == PSEUDO_PKT_IP )
+        pkth->priv_ptr = phdr->priv_ptr;
+#if defined(DAQ_VERSION) && DAQ_VERSION > 8
+    pkth->proto = phdr->proto;
+#endif
+#ifdef HAVE_DAQ_FLOW_ID
+    pkth->flow_id = phdr->flow_id;
+#endif
 #elif defined(HAVE_DAQ_ACQUIRE_WITH_META)
     pkth->opaque = opaque;
+#endif
+#ifdef HAVE_DAQ_REAL_ADDRESSES
+    if (pkth->flags & DAQ_PKT_FLAG_REAL_ADDRESSES)
+    {
+        pkth->n_real_sPort = phdr->n_real_sPort;
+        pkth->n_real_dPort = phdr->n_real_dPort;
+        pkth->real_sIP = phdr->real_sIP;
+        pkth->real_dIP = phdr->real_dIP;
+    }
 #endif
 
     if ( f & ENC_FLAG_NET )
@@ -401,21 +425,23 @@ Packet* Encode_New ()
 {
     Packet* p = SnortAlloc(sizeof(*p));
     uint8_t* b = SnortAlloc(sizeof(*p->pkth) + PKT_MAX + SPARC_TWIDDLE);
+    IP6Option* ip6_extensions = SnortAlloc(sizeof(IP6Option) * ScMaxIP6Extensions());
 
-    if ( !p || !b )
+    if ( !p || !b || !ip6_extensions )
         FatalError("Encode_New() => Failed to allocate packet\n");
 
     p->pkth = (void*)b;
     b += sizeof(*p->pkth);
     b += SPARC_TWIDDLE;
     p->pkt = b;
-
+    p->ip6_extensions = ip6_extensions;
     return p;
 }
 
 void Encode_Delete (Packet* p)
 {
     free((void*)p->pkth);  // cast away const!
+    free(p->ip6_extensions);
     free(p);
 }
 
@@ -424,6 +450,7 @@ void Encode_SetDstMAC(uint8_t *mac)
 {
    dst_mac = mac;
 }
+
 //-------------------------------------------------------------------------
 // private implementation stuff
 //-------------------------------------------------------------------------
@@ -546,11 +573,11 @@ static inline uint8_t GetTTL (const EncState* enc)
 
     // outermost ip is considered to be outer here,
     // even if it is the only ip layer ...
-    ttl = stream_api->get_session_ttl(enc->p->ssnptr, dir, outer);
+    ttl = session_api->get_session_ttl(enc->p->ssnptr, dir, outer);
 
     // so if we don't get outer, we use inner
     if ( 0 == ttl && outer )
-        ttl = stream_api->get_session_ttl(enc->p->ssnptr, dir, 0);
+        ttl = session_api->get_session_ttl(enc->p->ssnptr, dir, 0);
 
     return ttl;
 }
@@ -660,11 +687,78 @@ static void Eth_Format (EncodeFlags f, const Packet* p, Packet* c, Layer* lyr)
 }
 
 //-------------------------------------------------------------------------
+// FabricPath
+//-------------------------------------------------------------------------
+
+static ENC_STATUS FPath_Encode (EncState* enc, Buffer* in, Buffer* out)
+{
+    // not raw ip -> encode layer 2
+    int raw = ( enc->flags & ENC_FLAG_RAW );
+
+    FPathHdr* hi = (FPathHdr*)enc->p->layers[enc->layer-1].start;
+    PROTO_ID next = NextEncoder(enc);
+
+    // if not raw ip AND out buf is empty
+    if ( !raw && (out->off == out->end) )
+    {
+        // for alignment
+        out->off = out->end = 0;
+    }
+    // if not raw ip OR out buf is not empty
+    if ( !raw || (out->off != out->end) )
+    {
+        // we get here for outer-most layer when not raw ip
+        // we also get here for any encapsulated ethernet layer.
+        FPathHdr* ho = (FPathHdr*)(out->base + out->end);
+        UPDATE_BOUND(out, sizeof(*ho));
+
+        ho->fpath_type = hi->fpath_type;
+        if ( FORWARD(enc) )
+        {
+            memcpy(ho->fpath_src, hi->fpath_src, sizeof(ho->fpath_src));
+            memcpy(ho->fpath_dst, hi->fpath_dst, sizeof(ho->fpath_dst));
+        }
+        else
+        {
+            memcpy(ho->fpath_src, hi->fpath_dst, sizeof(ho->fpath_src));
+            memcpy(ho->fpath_dst, hi->fpath_src, sizeof(ho->fpath_dst));
+        }
+    }
+    if ( next < PROTO_MAX )
+        return encoders[next].fencode(enc, in, out);
+
+    return ENC_OK;
+}
+
+static ENC_STATUS FPath_Update (Packet* p, Layer* lyr, uint32_t* len)
+{
+    *len += lyr->length;
+    return ENC_OK;
+}
+
+static void FPath_Format (EncodeFlags f, const Packet* p, Packet* c, Layer* lyr)
+{
+    FPathHdr* ch = (FPathHdr*)lyr->start;
+
+    if ( REVERSE(f) )
+    {
+        int i = lyr - c->layers;
+        FPathHdr* ph = (FPathHdr*)p->layers[i].start;
+
+        memcpy(ch->fpath_dst, ph->fpath_src, sizeof(ch->fpath_dst));
+        memcpy(ch->fpath_src, ph->fpath_dst, sizeof(ch->fpath_src));
+    }
+}
+
+//-------------------------------------------------------------------------
 // VLAN
 //-------------------------------------------------------------------------
 
 static void VLAN_Format (EncodeFlags f, const Packet* p, Packet* c, Layer* lyr)
 {
+#ifdef HAVE_DAQ_REAL_ADDRESSES
+      if (!(p->pkth->flags & DAQ_PKT_FLAG_IGNORE_VLAN))
+#endif
     c->vh = (VlanTagHdr*)lyr->start;
 }
 
@@ -736,7 +830,7 @@ static ENC_STATUS IP4_Encode (EncState* enc, Buffer* in, Buffer* out)
 
     /* IPv4 encoded header is hardcoded 20 bytes, we save some
      * cycles and use the literal header size for checksum */
-    ho->ip_csum = in_chksum_ip((uint16_t *)ho, sizeof *ho);
+    ho->ip_csum = in_chksum_ip((const uint16_t *)ho, sizeof *ho);
 
     return ENC_OK;
 }
@@ -757,7 +851,7 @@ static ENC_STATUS IP4_Update (Packet* p, Layer* lyr, uint32_t* len)
     if ( !PacketWasCooked(p) || (p->packet_flags & PKT_REBUILT_FRAG) )
     {
         h->ip_csum = 0;
-        h->ip_csum = in_chksum_ip((uint16_t *)h, GET_IP_HDR_LEN(h));
+        h->ip_csum = in_chksum_ip((const uint16_t *)h, GET_IP_HDR_LEN(h));
     }
 
     return ENC_OK;
@@ -881,7 +975,7 @@ static ENC_STATUS UDP_Encode (EncState* enc, Buffer* in, Buffer* out)
     {
         next = enc->p->layers[enc->layer].proto;
     }
-    if ((PROTO_GTP == next) && (encoders[next].fencode))
+    if ( enc->type == ENC_UDP || ((PROTO_GTP == next) && (encoders[next].fencode)) )
     {
         int len;
         ENC_STATUS err;
@@ -902,10 +996,23 @@ static ENC_STATUS UDP_Encode (EncState* enc, Buffer* in, Buffer* out)
             ho->uh_dport = hi->uh_sport;
         }
 
-        next = NextEncoder(enc);
-        err = encoders[next].fencode(enc, in, out);
-        if (ENC_OK != err ) return err;
-        len = out->end - start;
+        if ( enc->type != ENC_UDP)
+        {
+            next = NextEncoder(enc);
+            if ( next < PROTO_MAX )
+            {
+                err = encoders[next].fencode(enc, in, out);
+                if (ENC_OK != err ) return err;
+            }
+            len = out->end - start;
+        }
+        else
+        {
+            uint8_t* pdu = out->base + out->end;
+            UPDATE_BOUND(out, enc->payLen);
+            memcpy(pdu, enc->payLoad, enc->payLen);
+            len = enc->payLen + sizeof(UDPHdr);
+        }
         ho->uh_len = htons((uint16_t)len);
 
         ho->uh_chk = 0;
@@ -958,12 +1065,16 @@ static ENC_STATUS UDP_Update (Packet* p, Layer* lyr, uint32_t* len)
             h->uh_chk = in_chksum_udp(&ps, (uint16_t *)h, *len);
         } else {
             pseudoheader6 ps6;
-            memcpy(ps6.sip, &p->ip6h->ip_src.ip32, sizeof(ps6.sip));
-            memcpy(ps6.dip, &p->ip6h->ip_dst.ip32, sizeof(ps6.dip));
-            ps6.zero = 0;
-            ps6.protocol = IPPROTO_UDP;
-            ps6.len = htons((uint16_t)*len);
-            h->uh_chk = in_chksum_udp6(&ps6, (uint16_t *)h, *len);
+            for (lyr--; lyr->proto != PROTO_IP6 && lyr != p->layers; lyr--);
+            if (lyr->proto == PROTO_IP6)
+            {
+                memcpy(ps6.sip, ((IP6RawHdr *)lyr->start)->ip6_src.s6_addr, sizeof(ps6.sip));
+                memcpy(ps6.dip, ((IP6RawHdr *)lyr->start)->ip6_dst.s6_addr, sizeof(ps6.dip));
+                ps6.zero = 0;
+                ps6.protocol = IPPROTO_UDP;
+                ps6.len = htons((uint16_t)*len);
+                h->uh_chk = in_chksum_udp6(&ps6, (uint16_t *)h, *len);
+            }
         }
     }
 
@@ -1119,12 +1230,16 @@ static ENC_STATUS TCP_Update (Packet* p, Layer* lyr, uint32_t* len)
             h->th_sum = in_chksum_tcp(&ps, (uint16_t *)h, *len);
         } else {
             pseudoheader6 ps6;
-            memcpy(ps6.sip, &p->ip6h->ip_src.ip32, sizeof(ps6.sip));
-            memcpy(ps6.dip, &p->ip6h->ip_dst.ip32, sizeof(ps6.dip));
-            ps6.zero = 0;
-            ps6.protocol = IPPROTO_TCP;
-            ps6.len = htons((uint16_t)*len);
-            h->th_sum = in_chksum_tcp6(&ps6, (uint16_t *)h, *len);
+            for (lyr--; lyr->proto != PROTO_IP6 && lyr != p->layers; lyr--);
+            if (lyr->proto == PROTO_IP6)
+            {
+                memcpy(ps6.sip, ((IP6RawHdr *)lyr->start)->ip6_src.s6_addr, sizeof(ps6.sip));
+                memcpy(ps6.dip, ((IP6RawHdr *)lyr->start)->ip6_dst.s6_addr, sizeof(ps6.dip));
+                ps6.zero = 0;
+                ps6.protocol = IPPROTO_TCP;
+                ps6.len = htons((uint16_t)*len);
+                h->th_sum = in_chksum_tcp6(&ps6, (uint16_t *)h, *len);
+            }
         }
     }
 
@@ -1304,42 +1419,55 @@ static inline int IcmpV6Code (EncodeType et) {
 }
 
 
-static inline ENC_STATUS UN6_Encode_ICMP6_Response(EncState* enc, Buffer* in, Buffer* out, bool udp_orig)
+static inline ENC_STATUS UN6_Encode_Icmpv6Hdr( EncState *enc, IcmpHdr *ho, Buffer *out )
 {
-    uint8_t* p;
-    uint8_t* hi = enc->p->layers[enc->layer-1].start;
-    IcmpHdr* ho = (IcmpHdr*)(out->base + out->end);
-    pseudoheader6 ps6;
-    int len;
-
-#ifdef DEBUG
-    if ( enc->type < ENC_UNR_NET )
-        return ENC_BAD_OPT;
-#endif
-
     enc->proto = IPPROTO_ICMPV6;
 
     UPDATE_BOUND(out, sizeof(*ho));
     ho->type = 1;   // dest unreachable
-    ho->code = IcmpV6Code( enc->type ); 
+    ho->code = IcmpV6Code( enc->type );
     ho->cksum = 0;
     ho->unused = 0;
+    return ENC_OK;
+}
+
+static inline ENC_STATUS UN6_Encode_OrigIcmpV6( EncState *enc, Buffer *out )
+{
+    uint8_t* p;
 
     // copy original ip header
     p = out->base + out->end;
     UPDATE_BOUND(out, enc->ip_len);
     // TBD should be able to elminate enc->ip_hdr by using layer-2
     memcpy(p, enc->ip_hdr, enc->ip_len);
+    return ENC_OK;
+}
+
+static inline ENC_STATUS UN6_Encode_OrigUdp( EncState *enc, Buffer *out )
+{
+    uint8_t* p;
+    uint8_t* hi = enc->p->layers[enc->layer-1].start;
+
+    // copy original ip header
+    p = out->base + out->end;
+    UPDATE_BOUND(out, enc->ip_len);
+    // TBD should be able to elminate enc->ip_hdr by using layer-2
+    memcpy(p, enc->ip_hdr, enc->ip_len);
+    ((IP6RawHdr*)p)->ip6nxt = IPPROTO_UDP;
 
     // copy first 8 octets of original ip data (ie udp header)
     // TBD: copy up to minimum MTU worth of data
-    if( udp_orig )
-    {
-        ((IP6RawHdr*)p)->ip6nxt = IPPROTO_UDP;
     p = out->base + out->end;
     UPDATE_BOUND(out, ICMP_UNREACH_DATA);
     memcpy(p, hi, ICMP_UNREACH_DATA);
-    }
+
+    return ENC_OK;
+}
+
+static inline void UN6_Encode_Compute_Chksum( EncState *enc, IcmpHdr *ho, Buffer *out )
+{
+    pseudoheader6 ps6;
+    int len;
 
     len = BUFF_DIFF(out, ho);
 
@@ -1350,18 +1478,38 @@ static inline ENC_STATUS UN6_Encode_ICMP6_Response(EncState* enc, Buffer* in, Bu
     ps6.len = htons((uint16_t)(len));
 
     ho->cksum = in_chksum_icmp6(&ps6, (uint16_t *)ho, len);
-
-    return ENC_OK;
 }
 
 static ENC_STATUS UN6_ICMP6_Encode (EncState* enc, Buffer* in, Buffer* out)
 {
-    return UN6_Encode_ICMP6_Response( enc, in, out, false );
+    IcmpHdr* ho = (IcmpHdr*)(out->base + out->end);
+
+#ifdef DEBUG
+    if ( enc->type < ENC_UNR_NET )
+        return ENC_BAD_OPT;
+#endif
+
+    UN6_Encode_Icmpv6Hdr( enc, ho, out);
+    UN6_Encode_OrigIcmpV6( enc, out );
+    UN6_Encode_Compute_Chksum( enc, ho, out );
+
+    return ENC_OK;
 }
 
 static ENC_STATUS UN6_UDP_Encode(EncState* enc, Buffer* in, Buffer* out)
 {
-    return UN6_Encode_ICMP6_Response( enc, in, out, true);
+    IcmpHdr* ho = (IcmpHdr*)(out->base + out->end);
+
+#ifdef DEBUG
+    if ( enc->type < ENC_UNR_NET )
+        return ENC_BAD_OPT;
+#endif
+
+    UN6_Encode_Icmpv6Hdr( enc, ho, out);
+    UN6_Encode_OrigUdp( enc, out );
+    UN6_Encode_Compute_Chksum( enc, ho, out );
+
+    return ENC_OK;
 }
 
 static ENC_STATUS ICMP6_Update (Packet* p, Layer* lyr, uint32_t* len)
@@ -1372,14 +1520,17 @@ static ENC_STATUS ICMP6_Update (Packet* p, Layer* lyr, uint32_t* len)
 
     if ( !PacketWasCooked(p) || (p->packet_flags & PKT_REBUILT_FRAG) ) {
         pseudoheader6 ps6;
-        h->cksum = 0;
-
-        memcpy(ps6.sip, &p->ip6h->ip_src.ip32, sizeof(ps6.sip));
-        memcpy(ps6.dip, &p->ip6h->ip_dst.ip32, sizeof(ps6.dip));
-        ps6.zero = 0;
-        ps6.protocol = IPPROTO_ICMPV6;
-        ps6.len = htons((uint16_t)*len);
-        h->cksum = in_chksum_icmp6(&ps6, (uint16_t *)h, *len);
+        for (lyr--; lyr->proto != PROTO_IP6 && lyr != p->layers; lyr--);
+        if (lyr->proto == PROTO_IP6)
+        {
+            h->cksum = 0;
+            memcpy(ps6.sip, ((IP6RawHdr *)lyr->start)->ip6_src.s6_addr, sizeof(ps6.sip));
+            memcpy(ps6.dip, ((IP6RawHdr *)lyr->start)->ip6_dst.s6_addr, sizeof(ps6.dip));
+            ps6.zero = 0;
+            ps6.protocol = IPPROTO_ICMPV6;
+            ps6.len = htons((uint16_t)*len);
+            h->cksum = in_chksum_icmp6(&ps6, (uint16_t *)h, *len);
+        }
     }
 
     return ENC_OK;
@@ -1474,6 +1625,55 @@ static ENC_STATUS PPPoE_Encode (EncState* enc, Buffer* in, Buffer* out)
     return ENC_OK;
 }
 
+ //-------------------------------------------------------------------------
+// MPLS functions
+//-------------------------------------------------------------------------
+
+static ENC_STATUS MPLS_Encode (EncState* enc, Buffer* in, Buffer* out)
+{
+   uint16_t n;
+   uint8_t* hi = NULL;
+   uint8_t* ho;
+   PROTO_ID next;
+
+   SessionControlBlock* scb = (SessionControlBlock*)(enc->p->ssnptr);
+
+   if ( FORWARD(enc) )
+   {
+       if( scb != NULL && scb->clientMplsHeader != NULL )
+       {
+           n  = scb->clientMplsHeader->length;
+           hi = scb->clientMplsHeader->start;
+       }
+   }
+   else
+   {
+       if( scb != NULL && scb->serverMplsHeader != NULL )
+       {
+           n  = scb->serverMplsHeader->length;
+           hi = scb->serverMplsHeader->start;
+       }
+   }
+   if(!(hi) )
+   {
+       n  = enc->p->layers[enc->layer-1].length;
+       hi = enc->p->layers[enc->layer-1].start;
+   }
+   ho = (uint8_t*)(out->base + out->end);
+   next = NextEncoder(enc);
+
+   UPDATE_BOUND(out, n);
+   memcpy(ho, hi, n);
+
+   if ( next < PROTO_MAX )
+   {
+       ENC_STATUS err = encoders[next].fencode(enc, in, out);
+       if (ENC_OK != err ) return err;
+   }
+   return ENC_OK;
+}
+
+
 //-------------------------------------------------------------------------
 // XXX (generic) functions
 //-------------------------------------------------------------------------
@@ -1515,10 +1715,57 @@ static ENC_STATUS XXX_Update (Packet* p, Layer* lyr, uint32_t* len)
     return ENC_OK;
 }
 
+static ENC_STATUS GRE_Update (Packet* p, Layer* lyr, uint32_t* len)
+{
+    GREHdr* h = (GREHdr*)(lyr->start);
+    *len += lyr->length;
+    if(GRE_CHKSUM(h))
+    {
+        if(lyr->length >= 6)
+        {
+            uint16_t *csum = (uint16_t *) (lyr->start + 4);
+            *csum = 0;
+            *csum = ones_compl_checksum((const char *)h, *len);           
+        }
+    }
+    return ENC_OK;
+}
+
 static void XXX_Format (EncodeFlags f, const Packet* p, Packet* c, Layer* lyr)
 {
     // nop
 }
+
+static ENC_STATUS GRE_Encode (EncState* enc, Buffer* in, Buffer* out)
+{
+    int n = enc->p->layers[enc->layer-1].length;
+
+    GREHdr* hi = (GREHdr *)enc->p->layers[enc->layer-1].start;
+    GREHdr* ho = (GREHdr *)(out->base + out->end);
+    PROTO_ID next = NextEncoder(enc);
+
+    UPDATE_BOUND(out, n);
+    memcpy(ho, hi, n);
+
+    if ( next < PROTO_MAX )
+    {
+        ENC_STATUS err = encoders[next].fencode(enc, in, out);
+        if (ENC_OK != err ) return err;
+    }
+    if(GRE_CHKSUM(ho))
+    {
+        if(n >= 6)
+        {
+            int len = BUFF_DIFF(out, ho);
+            uint16_t *csum = (uint16_t *) ((uint8_t *)ho + 4);
+            *csum = 0;	
+            *csum = ones_compl_checksum((const char *)ho, len);			 
+        }
+    }
+
+    return ENC_OK;
+}
+
 
 //-------------------------------------------------------------------------
 // function table:
@@ -1528,6 +1775,8 @@ static void XXX_Format (EncodeFlags f, const Packet* p, Packet* c, Layer* lyr)
 
 static EncoderFunctions encoders[PROTO_MAX] = {
     { Eth_Encode,  Eth_Update,   Eth_Format   },
+    { FPath_Encode, FPath_Update, FPath_Format },  // FabricPath
+    { XXX_Encode,  XXX_Update,   XXX_Format   }, // Cisco Metadata
     { IP4_Encode,  IP4_Update,   IP4_Format   },
     { UN4_Encode,  ICMP4_Update, ICMP4_Format },
     { XXX_Encode,  XXX_Update,   XXX_Format,  },  // ICMP_IP4
@@ -1540,13 +1789,13 @@ static EncoderFunctions encoders[PROTO_MAX] = {
     { XXX_Encode,  XXX_Update,   XXX_Format,  },  // ICMP_IP6
     { XXX_Encode,  XXX_Update,   VLAN_Format  },
 #ifdef GRE
-    { XXX_Encode,  XXX_Update,   GRE_Format   },
+    { GRE_Encode,  GRE_Update,   GRE_Format   },
     { XXX_Encode,  XXX_Update,   XXX_Format   },  // ERSPAN
 #endif
     { PPPoE_Encode,XXX_Update,   XXX_Format   },
     { XXX_Encode,  XXX_Update,   XXX_Format   },  // PPP Encap
 #ifdef MPLS
-    { XXX_Encode,  XXX_Update,   XXX_Format   },  // MPLS
+    { MPLS_Encode,  XXX_Update,   XXX_Format   },  // MPLS
 #endif
     { XXX_Encode,  XXX_Update,   XXX_Format,  },  // ARP
     { GTP_Encode,  GTP_Update,   XXX_Format,  },  // GTP

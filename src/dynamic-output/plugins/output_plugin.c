@@ -1,5 +1,5 @@
 /*
- ** Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+ ** Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
  ** Copyright (C) 2012-2013 Sourcefire, Inc.
  **
  ** This program is free software; you can redistribute it and/or modify
@@ -80,9 +80,14 @@ tSfPolicyId GetParserPolicy(struct _SnortConfig *sc)
     return getParserPolicy(sc);
 }
 
-tSfPolicyId GetRuntimePolicy(void)
+tSfPolicyId GetNapRuntimePolicy(void)
 {
-    return getRuntimePolicy();
+    return getNapRuntimePolicy();
+}
+
+tSfPolicyId GetIpsRuntimePolicy(void)
+{
+    return getIpsRuntimePolicy();
 }
 
 tSfPolicyId GetDefaultPolicy(void)
@@ -138,6 +143,7 @@ int initOutputPlugin(void *outputInit)
     outputData.textLog_Quote = (TextLog_PutsFunc)&TextLog_Quote;
     outputData.textLog_Write = (TextLog_WriteFunc)&TextLog_Write;
     outputData.textLog_Print = (TextLog_PrintFunc)&TextLog_Print;
+    outputData.textLog_PrintUnicode = (TextLog_PrintUnicodeFunc)&TextLog_PrintUnicode;
     outputData.textLog_Flush = (TextLog_FlushFunc)&TextLog_Flush;
     outputData.textLog_NewLine = (TextLog_NewLineFunc)&TextLog_NewLine;
     outputData.textLog_Puts = (TextLog_PutsFunc)&TextLog_Puts;
@@ -163,7 +169,8 @@ int initOutputPlugin(void *outputInit)
     outputData.debugMsg = &DebugMessageFunc;
     outputData.SnortStrdup = &SnortStrdup;
     outputData.SnortSnprintf = &SnortSnprintf;
-    outputData.getRuntimePolicy = GetRuntimePolicy;
+    outputData.getNapRuntimePolicy = GetNapRuntimePolicy;
+    outputData.getIpsRuntimePolicy = GetIpsRuntimePolicy;
     outputData.getParserPolicy = GetParserPolicy;
     outputData.getDefaultPolicy = GetDefaultPolicy;
     outputData.getBasePolicyVersion = &GetBasePolicyVersion;

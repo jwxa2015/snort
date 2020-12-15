@@ -1,6 +1,6 @@
 /****************************************************************************
  * 
- * Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+ * Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
  * Copyright (C) 2011-2013 Sourcefire, Inc.
  *
  * This program is free software; you can redistribute it and/or modify
@@ -24,7 +24,7 @@
  *
  * imap_util.h
  *
- * Author: Bhagyashree Bantwal <bbantwal@sourcefire.com>
+ * Author: Bhagyashree Bantwal <bbantwal@cisco.com>
  *
  *************************************************************************/
 
@@ -35,6 +35,7 @@
 
 void IMAP_GetEOL(const uint8_t *, const uint8_t *, const uint8_t **, const uint8_t **);
 void IMAP_DecodeType(const char *start, int length, bool cnt_xf);
+int IMAP_Print_Mem_Stats(char *buffer);
 
 #ifdef DEBUG_MSGS
 const char * IMAP_PrintBuffer(SFSnortPacket *);

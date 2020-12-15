@@ -1,6 +1,6 @@
 /****************************************************************************
  *
- * Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+ * Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
  * Copyright (C) 2003-2013 Sourcefire, Inc.
  *
  * This program is free software; you can redistribute it and/or modify
@@ -120,24 +120,23 @@ SFGHASH * sfghash_new( int nrows, int keysize, int userkeys, void (*userfree)(vo
    }
 
    h = (SFGHASH*)s_alloc( sizeof(SFGHASH) );
-   if( !h )
-	   return 0;
+   if( !h ) return 0;
 
    memset( h, 0, sizeof(SFGHASH) );
 
    h->sfhashfcn = sfhashfcn_new( nrows );
    if( !h->sfhashfcn )
    {
-       free(h);
-	   return 0;
+      free(h);
+      return 0;
    }
 
    h->table = (SFGHASH_NODE**) s_alloc( sizeof(SFGHASH_NODE*) * nrows );
    if( !h->table )
    {
-       free(h->sfhashfcn);
-       free(h);
-	   return 0;
+      free(h->sfhashfcn);
+      free(h);
+      return 0;
    }
 
    for( i=0; i<nrows; i++ )
@@ -167,7 +166,8 @@ SFGHASH * sfghash_new( int nrows, int keysize, int userkeys, void (*userfree)(vo
 */
 void sfghash_splaymode( SFGHASH * t, int n )
 {
-   t->splay = n;
+  if ( t )
+     t->splay = n;
 }
 
 /*
@@ -195,7 +195,7 @@ void sfghash_delete( SFGHASH * h )
         node  = node->next;
 
         if( !h->userkey && onode->key )
-            s_free( onode->key );
+            s_free( (void *)onode->key );
 
         if( h->userfree && onode->data )
             h->userfree( onode->data ); /* free users data, with users function */
@@ -215,8 +215,10 @@ void sfghash_delete( SFGHASH * h )
 */
 int sfghash_count( SFGHASH * t )
 {
+  if( !t ) return 0;
   return t->count;
 }
+
 
 
 
@@ -241,7 +243,7 @@ int sfghash_count( SFGHASH * t )
 *  linked list of data items held by the node, or track a counter, or whatever.
 *
 */
-int sfghash_add( SFGHASH * t, void * key, void * data )
+int sfghash_add( SFGHASH * t, const void * const key, void * const data )
 {
     unsigned    hashkey;
 	int         klen;
@@ -312,12 +314,12 @@ int sfghash_add( SFGHASH * t, void * key, void * data )
       hnode->key = s_alloc( klen );
       if( !hnode->key )
       {
-           free(hnode);
-           return SFGHASH_NOMEM;
+          free(hnode);
+          return SFGHASH_NOMEM;
       }
 
       /* Copy key  */
-      memcpy(hnode->key,key,klen);
+      memcpy((void*)hnode->key,key,klen);
     }
 
     /* Add The Node */
@@ -363,12 +365,13 @@ static void movetofront( SFGHASH *t , int index, SFGHASH_NODE * n )
 /*
 *  Find a Node based on the key, return users data.
 */
-static SFGHASH_NODE * sfghash_find_node( SFGHASH * t, void * key)
+SFGHASH_NODE * sfghash_find_node( SFGHASH * t, const void * const key)
 {
     unsigned    hashkey;
     int         index, klen;
     SFGHASH_NODE  *hnode;
 
+    if ( !t ) return NULL;
     if( t->keysize  )
     {
 	klen = t->keysize;
@@ -412,12 +415,10 @@ static SFGHASH_NODE * sfghash_find_node( SFGHASH * t, void * key)
 /*
 *  Find a Node based on the key, return users data.
 */
-void * sfghash_find( SFGHASH * t, void * key)
+void * sfghash_find( SFGHASH * t, const void * const key)
 {
     SFGHASH_NODE * hnode;
-
-    if (t == NULL)
-        return NULL;
+    if ( !t ) return NULL;
 
     hnode = sfghash_find_node( t, key );
 
@@ -454,11 +455,11 @@ int sfghash_find2(SFGHASH *t, void *key, void **data)
 static int sfghash_free_node( SFGHASH * t, unsigned index, SFGHASH_NODE * hnode )
 {
     if( !t->userkey && hnode->key )
-        s_free( hnode->key );
+        s_free( (void *)hnode->key );
     hnode->key = 0;
 
-    if( t->userfree && hnode->data )
-        t->userfree( hnode->data ); /* free users data, with users function */
+    if( t->userfree)
+        t->userfree( hnode->data); /* free users data, with users function */
 
     if( hnode->prev )  // not the 1st node
     {
@@ -484,11 +485,13 @@ static int sfghash_free_node( SFGHASH * t, unsigned index, SFGHASH_NODE * hnode 
 *  returns : 0 - OK
 *           -1 - node not found
 */
-int sfghash_remove( SFGHASH * t, void * key)
+int sfghash_remove( SFGHASH * t, const void * const key)
 {
     SFGHASH_NODE * hnode;
     int klen;
     unsigned hashkey, index;
+
+    if ( !t ) return 0;
 
     if( t->keysize > 0 )
     {
@@ -524,10 +527,56 @@ int sfghash_remove( SFGHASH * t, void * key)
    return SFGHASH_ERR;
 }
 
+/*
+*   Get First Hash Table Node
+*/
+SFGHASH_NODE * sfghash_findfirst1( SFGHASH * t )
+{
+    if ( !t ) return NULL;
+    /* Start with 1st row */
+    for( t->crow=0; t->crow < t->nrows; t->crow++ )
+    {
+       /* Get 1st Non-Null node in row list */
+       t->cnode = t->table[t->crow];
+
+       if( t->cnode ) return t->cnode;
+    }
+    return NULL;
+}
+
+/*
+*   Get Next Hash Table Node
+*/
+SFGHASH_NODE * sfghash_findnext1( SFGHASH * t )
+{
+    if ( !t ) return NULL;
+    if( t->cnode ) /* get next in this list */
+    {
+       /* Next node in current node list */
+       t->cnode = t->cnode->next;
+       if( t->cnode )
+       {
+           return t->cnode;
+       }
+    }
+
+    /* Get 1st node in next non-empty row/node list */
+    for( t->crow++; t->crow < t->nrows; t->crow++ )
+    {
+       t->cnode = t->table[ t->crow ];
+       if( t->cnode )
+       {
+           return t->cnode;
+       }
+    }
+
+    return  NULL;
+}
 
 /* Internal use only */
 static void sfghash_next( SFGHASH * t )
 {
+    if ( !t ) return;
     if( !t->cnode )
         return ;
 
@@ -556,6 +605,8 @@ SFGHASH_NODE * sfghash_findfirst( SFGHASH * t )
 {
     SFGHASH_NODE * n;
 
+    if ( !t ) return NULL;
+
     /* Start with 1st row */
     for( t->crow=0; t->crow < t->nrows; t->crow++ )
     {
@@ -580,6 +631,8 @@ SFGHASH_NODE * sfghash_findfirst( SFGHASH * t )
 SFGHASH_NODE * sfghash_findnext( SFGHASH * t )
 {
     SFGHASH_NODE * n;
+
+    if ( !t ) return NULL;
 
     n = t->cnode;
 

@@ -1,5 +1,5 @@
 /****************************************************************************
- * Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+ * Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
  * Copyright (C) 2008-2013 Sourcefire, Inc.
  *
  * This program is free software; you can redistribute it and/or modify
@@ -46,9 +46,7 @@ typedef enum _option_type_t
     RULE_OPTION_TYPE_IP_TOS,
     RULE_OPTION_TYPE_IS_DATA_AT,
     RULE_OPTION_TYPE_FILE_DATA,
-#if defined(FEAT_FILE_INSPECT)
     RULE_OPTION_TYPE_FILE_TYPE,
-#endif
     RULE_OPTION_TYPE_BASE64_DECODE,
     RULE_OPTION_TYPE_BASE64_DATA,
     RULE_OPTION_TYPE_PKT_DATA,
@@ -71,7 +69,13 @@ typedef enum _option_type_t
     RULE_OPTION_TYPE_URILEN,
     RULE_OPTION_TYPE_HDR_OPT_CHECK,
     RULE_OPTION_TYPE_PREPROCESSOR,
+#if !defined(FEAT_OPEN_APPID)
     RULE_OPTION_TYPE_DYNAMIC
+#else /* defined(FEAT_OPEN_APPID) */
+    RULE_OPTION_TYPE_DYNAMIC,
+    RULE_OPTION_TYPE_APPID
+#endif /* defined(FEAT_OPEN_APPID) */
+    ,RULE_OPTION_TYPE_BYTE_MATH
 
 } option_type_t;
 

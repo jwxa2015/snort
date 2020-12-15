@@ -1,6 +1,6 @@
 /****************************************************************************
  *
- * Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+ * Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
  * Copyright (C) 2006-2013 Sourcefire, Inc.
  *
  * This program is free software; you can redistribute it and/or modify
@@ -319,13 +319,14 @@ void sfrt_free(table_t *table)
 }
 
 /* Perform a lookup on value contained in "ip" */
-GENERIC sfrt_lookup(void *adr, table_t* table)
+GENERIC sfrt_lookup(sfaddr_t* ip, table_t* table)
 {
     tuple_t tuple;
-    sfip_t *ip;
-    void *rt = NULL;
+    uint32_t* adr;
+    int numAdrDwords;
+    void *rt;
 
-    if(!adr)
+    if(!ip)
     {
         return NULL;
     }
@@ -335,22 +336,20 @@ GENERIC sfrt_lookup(void *adr, table_t* table)
         return NULL;
     }
 
-    ip = adr;
-    if (ip->family == AF_INET)
+    if (sfaddr_family(ip) == AF_INET)
     {
+        adr = sfaddr_get_ip4_ptr(ip);
+        numAdrDwords = 1;
         rt = table->rt;
     }
-    else if (ip->family == AF_INET6)
+    else
     {
+        adr = sfaddr_get_ip6_ptr(ip);
+        numAdrDwords = 4;
         rt = table->rt6;
     }
 
-    if (!rt)
-    {
-        return NULL;
-    }
-
-    tuple = table->lookup(ip, rt);
+    tuple = table->lookup(adr, numAdrDwords, rt);
 
     if(tuple.index >= table->max_size)
     {
@@ -500,39 +499,32 @@ void sfrt_cleanup(table_t* table, sfrt_iterator_callback cleanup_func)
     return;
 }
 
-GENERIC sfrt_search(void *adr, unsigned char len, table_t *table)
+GENERIC sfrt_search(sfaddr_t* ip, table_t *table)
 {
-    sfip_t *ip;
+    uint32_t* adr;
+    int numAdrDwords;
     tuple_t tuple;
     void *rt = NULL;
 
-    if ((adr == NULL) || (table == NULL) || (len == 0))
+    if ((ip == NULL) || (table == NULL))
         return NULL;
 
-    ip = adr;
-    if (ip->family == AF_INET)
+    if (sfaddr_family(ip) == AF_INET)
     {
+        adr = sfaddr_get_ip4_ptr(ip);
+        numAdrDwords = 1;
         rt = table->rt;
     }
-    else if (ip->family == AF_INET6)
+    else
     {
+        adr = sfaddr_get_ip6_ptr(ip);
+        numAdrDwords = 4;
         rt = table->rt6;
     }
-    /* IPv6 not yet supported */
-    if (table->ip_type == IPv6)
-        return NULL;
 
-    if( (table->ip_type == IPv4 && len > 32) ||
-        (table->ip_type == IPv6 && len > 128) )
-    {
-        return NULL;
-    }
+    tuple = table->lookup(adr, numAdrDwords, rt);
 
-    ip = adr;
-
-    tuple = table->lookup(ip, rt);
-
-    if (tuple.length != len)
+    if(tuple.index >= table->max_size)
         return NULL;
 
     return table->data[tuple.index];
@@ -540,17 +532,18 @@ GENERIC sfrt_search(void *adr, unsigned char len, table_t *table)
 
 /* Insert "ip", of length "len", into "table", and have it point to "ptr" */
 /* Insert "ip", of length "len", into "table", and have it point to "ptr" */
-int sfrt_insert(void *adr, unsigned char len, GENERIC ptr,
+int sfrt_insert(sfcidr_t* ip, unsigned char len, GENERIC ptr,
 					   int behavior, table_t *table)
 {
     int index;
     int newIndex = 0;
     int res;
-    sfip_t *ip;
+    uint32_t* adr;
+    int numAdrDwords;
     tuple_t tuple;
     void *rt = NULL;
 
-    if(!adr)
+    if(!ip)
     {
         return RT_INSERT_FAILURE;
     }
@@ -563,13 +556,10 @@ int sfrt_insert(void *adr, unsigned char len, GENERIC ptr,
         return RT_INSERT_FAILURE;
     }
 
-    if( (table->ip_type == IPv4 && len > 32) ||
-        (table->ip_type == IPv6 && len > 128) )
+    if (len > 128)
     {
         return RT_INSERT_FAILURE;
     }
-
-    ip = adr;
 
     /* Check if we can reuse an existing data table entry by
      * seeing if there is an existing entry with the same length. */
@@ -579,12 +569,21 @@ int sfrt_insert(void *adr, unsigned char len, GENERIC ptr,
     {
 #endif
 
-        if (ip->family == AF_INET)
+        if (sfaddr_family(&ip->addr) == AF_INET)
         {
+            if (len < 96)
+            {
+                return RT_INSERT_FAILURE;
+            }
+            len -= 96;
+            adr = sfip_get_ip4_ptr(ip);
+            numAdrDwords = 1;
             rt = table->rt;
         }
-        else if (ip->family == AF_INET6)
+        else
         {
+            adr = sfip_get_ip6_ptr(ip);
+            numAdrDwords = 4;
             rt = table->rt6;
         }
         if (!rt)
@@ -592,7 +591,7 @@ int sfrt_insert(void *adr, unsigned char len, GENERIC ptr,
             return RT_INSERT_FAILURE;
         }
 
-        tuple = table->lookup(ip, table->rt);
+        tuple = table->lookup(adr, numAdrDwords, rt);
 
 #ifdef SUPPORT_LCTRIE
     }
@@ -621,7 +620,7 @@ int sfrt_insert(void *adr, unsigned char len, GENERIC ptr,
 
     /* The actual value that is looked-up is an index
      * into the data table. */
-    res = table->insert(ip, len, index, behavior, rt);
+    res = table->insert(adr, numAdrDwords, len, index, behavior, rt);
 
     if ((res == RT_SUCCESS) && newIndex)
     {
@@ -679,7 +678,7 @@ uint32_t sfrt_usage(table_t *table)
 
 /** Remove subnet from sfrt table.
  * Remove subnet identified by ip/len and return associated data.
- * @param adr - IP address
+ * @param ip  - IP address
  * @param len - length of netmask
  * @param ptr - void ** that is set to value associated with subnet
  * @param behavior - RT_FAVOR_SPECIFIC or RT_FAVOR_TIME
@@ -687,14 +686,15 @@ uint32_t sfrt_usage(table_t *table)
  * will then point to null data. This can cause hung or crosslinked data. RT_FAVOR_SPECIFIC does not have this drawback.
  * hung or crosslinked entries.
  */
-int sfrt_remove(void *adr, unsigned char len, GENERIC *ptr,
+int sfrt_remove(sfcidr_t* ip, unsigned char len, GENERIC *ptr,
 					   int behavior, table_t *table)
 {
     int index;
-    sfip_t *ip;
+    uint32_t* adr;
+    int numAdrDwords;
     void *rt = NULL;
 
-    if(!adr)
+    if(!ip)
     {
         return RT_REMOVE_FAILURE;
     }
@@ -708,30 +708,32 @@ int sfrt_remove(void *adr, unsigned char len, GENERIC *ptr,
         return RT_REMOVE_FAILURE;
     }
 
-    if( (table->ip_type == IPv4 && len > 32) ||
-        (table->ip_type == IPv6 && len > 128) )
+    if (len > 128)
     {
         return RT_REMOVE_FAILURE;
     }
-
-    ip = adr;
 
 #ifdef SUPPORT_LCTRIE
     if(table->table_type != LCT)
     {
 #endif
 
-        if (ip->family == AF_INET)
+        if (sfaddr_family(&ip->addr) == AF_INET)
         {
+            if (len < 96)
+            {
+                return RT_REMOVE_FAILURE;
+            }
+            len -= 96;
+            adr = sfip_get_ip4_ptr(ip);
+            numAdrDwords = 1;
             rt = table->rt;
         }
-        else if (ip->family == AF_INET6)
+        else
         {
+            adr = sfip_get_ip6_ptr(ip);
+            numAdrDwords = 4;
             rt = table->rt6;
-        }
-        if (!rt)
-        {
-            return RT_REMOVE_FAILURE;
         }
 
 #ifdef SUPPORT_LCTRIE
@@ -740,13 +742,13 @@ int sfrt_remove(void *adr, unsigned char len, GENERIC *ptr,
 
     /* The actual value that is looked-up is an index
      * into the data table. */
-    index = table->remove(ip, len, behavior, rt);
+    index = table->remove(adr, numAdrDwords, len, behavior, rt);
 
     /* Remove value into policy table. See TBD in function header*/
     if (index)
     {
         *ptr = table->data[ index ];
-        table->data[ index ] = 0;
+        table->data[ index ] = NULL;
         table->num_ent--;
     }
 

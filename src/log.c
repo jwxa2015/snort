@@ -1,6 +1,6 @@
 /* $Id$ */
 /*
-** Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+** Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
 ** Copyright (C) 2002-2013 Sourcefire, Inc.
 ** Copyright (C) 1998-2002 Martin Roesch <roesch@sourcefire.com>
 **
@@ -311,12 +311,12 @@ void PrintNetData(FILE * fp, const u_char * start, const int len, Packet *p)
  *
  * Returns: void function
  */
-void PrintCharData(FILE * fp, char *data, int data_len)
+void PrintCharData(FILE * fp, const char *data, int data_len)
 {
     int bytes_processed;    /* count of bytes in the data buffer
                  * processed so far */
     int linecount = 0;      /* number of lines in this dump */
-    char *index;        /* index pointer into the data buffer */
+    const char *index;        /* index pointer into the data buffer */
     char *ddb_ptr;      /* index pointer into the data_dump_buffer */
     int size;
 
@@ -417,10 +417,26 @@ static int PrintObfuscatedData(FILE* fp, Packet *p)
     {
         uint8_t buf[UINT16_MAX];
         uint16_t dlen = p->data - p->pkt;
+        int ret;
 
-        SafeMemcpy(buf, p->pkt, dlen, buf, buf + sizeof(buf));
-        SafeMemcpy(buf + dlen, payload, payload_len,
+        ret = SafeMemcpy(buf, p->pkt, dlen, buf, buf + sizeof(buf));
+        if (ret != SAFEMEM_SUCCESS) 
+        {
+           DEBUG_WRAP(DebugMessage(DEBUG_LOG,
+                   "%s: SafeMemcpy() Failed !!!",  __FUNCTION__);)
+           free(payload);
+           return -1;
+        }
+
+        ret = SafeMemcpy(buf + dlen, payload, payload_len,
                 buf, buf + sizeof(buf));
+        if (ret != SAFEMEM_SUCCESS)
+        {
+            DEBUG_WRAP(DebugMessage(DEBUG_LOG,
+                    "%s: SafeMemcpy() Failed !!!",  __FUNCTION__);)
+            free(payload);
+            return -1;
+        }
 
         PrintNetData(fp, buf, dlen + payload_len, NULL);
     }
@@ -554,12 +570,12 @@ void PrintIPPkt(FILE * fp, int type, Packet * p)
             if(!IsJSNormData(p->ssnptr))
             {
                 fprintf(fp, "%s\n", "Normalized JavaScript for this packet");
-                PrintCharData(fp, (char *)file_data_ptr.data, file_data_ptr.len);
+                PrintCharData(fp, (const char*)file_data_ptr.data, file_data_ptr.len);
             }
             else if(!IsGzipData(p->ssnptr))
             {
                 fprintf(fp, "%s\n", "Decompressed Data for this packet");
-                PrintCharData(fp, (char *)file_data_ptr.data, file_data_ptr.len);
+                PrintCharData(fp, (const char*)file_data_ptr.data, file_data_ptr.len);
             }
         }
         else
@@ -1342,8 +1358,8 @@ void PrintICMPHeader(FILE * fp, Packet * p)
             }
 
 /* written this way since inet_ntoa was typedef'ed to use sfip_ntoa
- * which requires sfip_t instead of inaddr's.  This call to inet_ntoa
- * is a rare case that doesn't use sfip_t's. */
+ * which requires sfcidr_t instead of inaddr's.  This call to inet_ntoa
+ * is a rare case that doesn't use sfcidr_t's. */
 
 // XXX-IPv6 NOT YET IMPLEMENTED - IPV6 addresses technically not supported - need to change ICMP header
 
@@ -1757,6 +1773,10 @@ void PrintTcpOptions(FILE * fp, Packet * p)
                 fwrite("SackOK ", 7, 1, fp);
                 break;
 
+            case TCPOPT_TFO:
+                fwrite("TFO ", 4, 1, fp);
+                break; 
+
             case TCPOPT_ECHO:
                 memset((char *) tmp, 0, 5);
                 if (p->tcp_options[i].data)
@@ -1907,7 +1927,11 @@ void SetEvent
 void SnortSetEvent
 #endif
        (Event *event, uint32_t generator, uint32_t id, uint32_t rev,
+#if !defined(FEAT_OPEN_APPID)
         uint32_t classification, uint32_t priority, uint32_t event_ref)
+#else /* defined(FEAT_OPEN_APPID) */
+        uint32_t classification, uint32_t priority, uint32_t event_ref, char *event_appid)
+#endif /* defined(FEAT_OPEN_APPID) */
 {
     event->sig_generator = generator;
     event->sig_id = id;
@@ -1920,6 +1944,13 @@ void SnortSetEvent
         event->event_reference = event_ref;
     else
         event->event_reference = event->event_id;
+#if defined(FEAT_OPEN_APPID)
+
+    if (event_appid)
+        memcpy(event->app_name, event_appid, MAX_EVENT_APPNAME_LEN);
+    else
+        event->app_name[0] = 0;
+#endif /* defined(FEAT_OPEN_APPID) */
 
     event->ref_time.tv_sec = 0;
 

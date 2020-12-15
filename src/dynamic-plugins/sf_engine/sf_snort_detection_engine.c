@@ -16,7 +16,7 @@
  * along with this program; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
  *
- * Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+ * Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
  * Copyright (C) 2005-2013 Sourcefire, Inc.
  *
  * Author: Steve Sturges
@@ -96,7 +96,6 @@ ENGINE_LINKAGE int InitializeEngine(DynamicEngineData *ded)
 
 ENGINE_LINKAGE int LibVersion(DynamicPluginMeta *dpm)
 {
-
     dpm->type  = TYPE_ENGINE;
     dpm->major = MAJOR_VERSION;
     dpm->minor = MINOR_VERSION;
@@ -187,7 +186,7 @@ static int GetDynamicContents(void *r, int type, FPContentInfo **contents)
     int base64_buf_flag = 0;
     int mime_buf_flag = 0;
 
-    if ((r == NULL) || (contents == NULL))
+    if ((r == NULL) || (contents == NULL) || (!rule->initialized) || (rule->options == NULL))
         return -1;
 
     *contents = NULL;
@@ -319,6 +318,10 @@ static int GetDynamicPreprocOptFpContents(void *r, FPContentInfo **fp_contents)
         return -1;
 
     *fp_contents = NULL;
+
+    if (rule->options == NULL) {
+        return (-1);
+    }
 
     /* Get flow direction */
     for (i = 0, option = rule->options[i];
@@ -586,6 +589,91 @@ static int DecodeContentPattern(Rule *rule, ContentInfo *content)
     return 0;
 }
 
+static bool HexToNybble( char Chr, uint8_t *Val )
+{
+    if( !isxdigit( (int)Chr ) )
+    {
+        *Val = 0;
+        return( false );
+    }
+
+    if( isdigit( Chr ) )
+        *Val = (uint8_t)(Chr - '0');
+    else
+        *Val = (uint8_t)(((char)toupper(Chr) - 'A') + 10);
+
+    return( true );
+}
+
+static bool HexToByte( char *Str, uint8_t *Val )
+{
+    uint8_t nybble;
+
+    *Val = 0;
+
+    if( HexToNybble( *Str++, &nybble ) )
+    {
+        *Val = ((nybble & 0xf) << 4);
+        if( HexToNybble( *Str, &nybble ) )
+        {
+            *Val |= (nybble & 0xf);
+            return( true );
+        }
+    }
+
+    return( false );
+}
+
+static int DecodeProtectedContentPattern(Rule *rule, ProtectedContentInfo *content)
+{
+    unsigned int index;
+    const uint8_t *pat_idx = content->pattern;
+    uint8_t tmp_buf[2048];
+
+    /* First, setup the raw data by parsing content */
+
+    index = 0;
+
+    while((*pat_idx != '\0') && (index < 2048))
+    {
+        if( !HexToByte( (char *)pat_idx, &(tmp_buf[index]) ) )
+        {
+            DynamicEngineFatalMessage("Content argument has invalid "
+                                      "number of hex digits for dynamic rule [%d:%d].\n",
+                                      rule->info.genID, rule->info.sigID);
+        }
+
+        pat_idx += 2;
+        index += 1;
+    }
+
+    if( (*pat_idx == '\0') && (index == 0) )
+    {
+        DynamicEngineFatalMessage("ParseProtectedPattern() zero length pattern in "
+                                  "dynamic rule [%d:%d]!\n",
+                                  rule->info.genID, rule->info.sigID);
+    }
+
+
+    if( (*pat_idx != '\0') && (index == 2048) )
+    {
+        DynamicEngineFatalMessage("ParsePattern() buffer overflow in "
+                                  "dynamic rule [%d:%d]!\n",
+                                  rule->info.genID, rule->info.sigID);
+    }
+
+    /* Now, tmp_buf contains the decoded ascii & raw binary from the patter */
+    content->patternByteForm = (uint8_t *)calloc(index, sizeof(uint8_t));
+    if (content->patternByteForm == NULL)
+    {
+        DynamicEngineFatalMessage("Failed to allocate memory\n");
+    }
+
+    memcpy(content->patternByteForm, tmp_buf, index);
+    content->patternByteFormLength = index;
+
+    return 0;
+}
 static unsigned int getNonRepeatingLength(char *data, int data_len)
 {
     int i, j;
@@ -751,7 +839,7 @@ int RegisterOneRule(struct _SnortConfig *sc, Rule *rule, int registerRule)
     RuleOption *option;
     int fast_pattern = 0;
 
-    for (i=0;rule->options[i] != NULL; i++)
+    for (i=0; ((rule->options) && rule->options[i] != NULL); i++)
     {
         option = rule->options[i];
         switch (option->optionType)
@@ -794,6 +882,19 @@ int RegisterOneRule(struct _SnortConfig *sc, Rule *rule, int registerRule)
 
                     if (content->flags & CONTENT_FAST_PATTERN)
                         fast_pattern = 1;
+                }
+                break;
+           case OPTION_TYPE_PROTECTED_CONTENT:
+                {
+                    ProtectedContentInfo *content = option->option_u.protectedContent;
+
+                    if (!content->patternByteForm)
+                        DecodeProtectedContentPattern(rule, content);
+
+                    if ( HTTP_CONTENT(content->flags) )
+                        contentFlags |= CONTENT_HTTP;
+                    else
+                        contentFlags |= CONTENT_NORMAL;
                 }
                 break;
             case OPTION_TYPE_PCRE:
@@ -890,6 +991,7 @@ int RegisterOneRule(struct _SnortConfig *sc, Rule *rule, int registerRule)
                 break;
 
             case OPTION_TYPE_BYTE_TEST:
+            case OPTION_TYPE_BYTE_MATH:
             case OPTION_TYPE_BYTE_JUMP:
                 {
                     ByteData *byte = option->option_u.byte;
@@ -957,7 +1059,7 @@ int RegisterOneRule(struct _SnortConfig *sc, Rule *rule, int registerRule)
                     &FreeOneRule,
                     &GetDynamicPreprocOptFpContents) == -1)
         {
-            for (i = 0; rule->options[i] != NULL; i++)
+            for (i = 0; ((rule->options) && rule->options[i] != NULL); i++)
             {
                 option = rule->options[i];
                 switch (option->optionType)
@@ -986,7 +1088,7 @@ static void FreeOneRule(void *data)
     int i;
     Rule *rule = (Rule *)data;
 
-    if (rule == NULL)
+    if (rule == NULL || (!rule->options))
         return;
 
     /* More than one rule may use the same rule option so make sure anything
@@ -1081,6 +1183,7 @@ static void FreeOneRule(void *data)
                     }
                 }
             case OPTION_TYPE_BYTE_TEST:
+            case OPTION_TYPE_BYTE_MATH:
             case OPTION_TYPE_BYTE_JUMP:
             case OPTION_TYPE_FILE_DATA:
             case OPTION_TYPE_PKT_DATA:
@@ -1131,7 +1234,7 @@ static int DumpRule(FILE *fp, Rule *rule)
     if (rule->info.priority != 0)
         fprintf(fp, "priority:%d; ", rule->info.priority);
 
-    for (i = 0; rule->options[i] != NULL; i++)
+    for (i = 0; ((rule->options) && rule->options[i] != NULL); i++)
     {
         if( rule->options[i]->optionType == OPTION_TYPE_FLOWBIT )
         {

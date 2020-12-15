@@ -1,7 +1,7 @@
 /*
  * ftpp_ui_config.h
  *
- * Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+ * Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
  * Copyright (C) 2004-2013 Sourcefire, Inc.
  * Steven A. Sturges <ssturges@sourcefire.com>
  * Daniel J. Roelker <droelker@sourcefire.com>
@@ -46,7 +46,6 @@
 #include "ipv6_port.h"
 #include "sfrt.h"
 #include "snort_bounds.h"
-
 /*
  * Defines
  */
@@ -191,6 +190,7 @@ typedef struct s_FTP_CMD_CONF
     int  check_validity;
     int  data_chan_cmd;
     int  data_xfer_cmd;
+    int  data_rest_cmd;
     int  file_put_cmd;
     int  file_get_cmd;
     int  encr_cmd;
@@ -243,8 +243,7 @@ typedef struct s_FTP_SERVER_PROTO_CONF
 
 typedef struct s_FTP_BOUNCE_TO
 {
-    snort_ip ip;
-    int relevant_bits;
+    sfcidr_t ip;
     unsigned short portlo;
     unsigned short porthi;
 } FTP_BOUNCE_TO;
@@ -337,8 +336,8 @@ int ftpp_ui_config_reset_ftp_cmd(FTP_CMD_CONF *FTPCmd);
 int ftpp_ui_config_reset_telnet_proto(TELNET_PROTO_CONF *ClientConf);
 
 int ftpp_ui_config_add_ftp_client(FTPTELNET_GLOBAL_CONF *GlobalConf,
-                            sfip_t* ClientIP, FTP_CLIENT_PROTO_CONF *ClientConf);
+                            sfcidr_t* ClientIP, FTP_CLIENT_PROTO_CONF *ClientConf);
 int ftpp_ui_config_add_ftp_server(FTPTELNET_GLOBAL_CONF *GlobalConf,
-                            sfip_t *ClientIP, FTP_SERVER_PROTO_CONF *ClientConf);
+                            sfcidr_t *ClientIP, FTP_SERVER_PROTO_CONF *ClientConf);
 
 #endif

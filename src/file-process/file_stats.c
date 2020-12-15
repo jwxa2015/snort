@@ -1,7 +1,7 @@
 /*
  **
  **
- **  Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+ **  Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
  **  Copyright (C) 2013-2013 Sourcefire, Inc.
  **
  **  This program is free software; you can redistribute it and/or modify
@@ -41,8 +41,9 @@
 FileStats file_stats;
 
 #if defined(DEBUG_MSGS) || defined (REG_TEST)
+#include <locale.h>
 #define MAX_CONTEXT_INFO_LEN 1024
-void printFileContext (FileContext* context)
+void printFileContext(FileContext* context)
 {
     char buf[MAX_CONTEXT_INFO_LEN + 1];
     int unused;
@@ -55,21 +56,53 @@ void printFileContext (FileContext* context)
         return;
     }
     unused = sizeof(buf) - 1;
-    used = snprintf(cur, unused, "File name: ");
 
-    if (used < 0)
+    printf("File name: ");
+    if(context->file_name && (context->file_name_size > 0))
     {
-        printf("Fail to output file context\n");
-        return;
-    }
-    unused -= used;
-    cur += used;
+        FileCharEncoding encoding = file_api->get_character_encoding(context->file_name, context->file_name_size);
+        if((encoding == SNORT_CHAR_ENCODING_UTF_16LE) || (encoding == SNORT_CHAR_ENCODING_UTF_16BE))
+        {
+            setlocale(LC_ALL, "");
+            int i;
+            for (i = 2; i < context->file_name_size; i+=2)
+            {
+                uint16_t value = 0;
+                if(encoding == SNORT_CHAR_ENCODING_UTF_16LE)
+                    value = context->file_name[i] + (context->file_name[i + 1] << 8);
+                else if(encoding == SNORT_CHAR_ENCODING_UTF_16BE)
+                    value = (context->file_name[i] << 8) + context->file_name[i + 1];
 
-    if ((context->file_name_size > 0) && (unused > (int) context->file_name_size))
-    {
-        strncpy(cur, (char *)context->file_name, context->file_name_size );
-        unused -= context->file_name_size;
-        cur += context->file_name_size;
+                if(0 == value)
+                    break;
+                printf("%lc", value);
+            }
+        }
+        else if(encoding == SNORT_CHAR_ENCODING_ASCII)
+        {
+            if (unused > (int) context->file_name_size)
+            {
+                uint32_t i;
+                uint32_t size = context->file_name_size;
+                for (i = 0; i < size; i++)
+                {
+                    if (isprint((int)context->file_name[i]))
+                        cur[i] = (char)context->file_name[i];
+                    else
+                        cur[i] = '.';
+                }
+
+                if (!context->file_name[size-1])
+                    size--;
+
+                unused -= size;
+                cur += size;
+            }
+        }
+        else
+        {
+            printf("<<Filename Encoding not supported>>");
+        }
     }
 
     if (unused > 0)
@@ -100,58 +133,17 @@ void printFileContext (FileContext* context)
     printf("%s", buf);
 }
 
-void DumpHex(FILE *fp, const uint8_t *data, unsigned len)
-{
-    char str[18];
-    unsigned i;
-    unsigned pos;
-    char c;
+#include "sfdebug.h"
 
+void DumpHexFile(FILE *fp, const uint8_t *data, unsigned len)
+{
     FileConfig *file_config =  (FileConfig *)(snort_conf->file_config);
 
     if (file_config->show_data_depth < (int64_t)len)
         len = file_config->show_data_depth;
 
     fprintf(fp,"Show length: %d \n", len);
-    for (i=0, pos=0; i<len; i++, pos++)
-    {
-        if (pos == 17)
-        {
-            str[pos] = 0;
-            fprintf(fp, "  %s\n", str);
-            pos = 0;
-        }
-        else if (pos == 8)
-        {
-            str[pos] = ' ';
-            pos++;
-            fprintf(fp, "%s", " ");
-        }
-        c = (char)data[i];
-        if (isprint(c) && (c == ' ' || !isspace(c)))
-            str[pos] = c;
-        else
-            str[pos] = '.';
-        fprintf(fp, "%02X ", data[i]);
-    }
-    if (pos)
-    {
-        str[pos] = 0;
-        for (; pos < 17; pos++)
-        {
-            if (pos == 8)
-            {
-                str[pos] = ' ';
-                pos++;
-                fprintf(fp, "%s", "    ");
-            }
-            else
-            {
-                fprintf(fp, "%s", "   ");
-            }
-        }
-        fprintf(fp, "  %s\n", str);
-    }
+    DumpHex(fp, data, len);
 }
 #endif
 
@@ -303,7 +295,7 @@ void print_file_stats(int exiting)
     LogMessage("   %12s:           "FMTu64("-10")" \n", "Total",verdicts_total);
 
 #ifdef TARGET_BASED
-    if (IsAdaptiveConfigured(getRuntimePolicy()))
+    if (IsAdaptiveConfigured())
     {
         LogMessage("\nFiles processed by protocol IDs:\n");
         for (i = 0; i < MAX_PROTOCOL_ORDINAL; i++)

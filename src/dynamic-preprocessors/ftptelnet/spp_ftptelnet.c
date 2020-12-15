@@ -1,7 +1,7 @@
 /*
  * spp_ftptelnet.c
  *
- * Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+ * Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
  * Copyright (C) 2004-2013 Sourcefire, Inc.
  * Steven A. Sturges <ssturges@sourcefire.com>
  * Daniel J. Roelker <droelker@sourcefire.com>
@@ -54,10 +54,6 @@
 #include "snort_debug.h"
 
 #include "ftpp_ui_config.h"
-#ifdef CLIENT_READY
-#include "ftp_client.h"
-#include "ftp_norm.h"
-#endif
 #include "snort_ftptelnet.h"
 #include "spp_ftptelnet.h"
 #include "sf_preproc_info.h"
@@ -66,6 +62,15 @@
 
 #include "sfPolicy.h"
 #include "sfPolicyUserData.h"
+#ifdef REG_TEST
+#include "ftpp_si.h"
+#endif
+
+#ifdef DUMP_BUFFER
+#include "ftptelnet_buffer_dump.h"
+#endif
+
+#include "reg_test.h"
 
 const int MAJOR_VERSION = 1;
 const int MINOR_VERSION = 2;
@@ -100,6 +105,7 @@ PreprocStats telnetPerfStats;
 PreprocStats ftpdataPerfStats;
 #endif
 #endif
+FTPTelnet_Stats ftp_telnet_stats;
 
 /*
  * Global Variables
@@ -120,6 +126,7 @@ int16_t telnet_app_id = 0;
 /* static function prototypes */
 static void FTPTelnetReset(int, void *);
 static void FTPTelnetResetStats(int, void *);
+static void FTPTelnetStats(int);
 
 #ifdef SNORT_RELOAD
 static void FtpTelnetReloadGlobal(struct _SnortConfig *, char *, void **);
@@ -164,9 +171,9 @@ void FTPDataTelnetChecks(void *pkt, void *context)
     // precondition - what we registered for
     assert(IsTCP(p));
 
-    if ( _dpd.fileAPI->get_max_file_depth() >= 0 )
+    if ( _dpd.fileAPI->get_max_file_depth(NULL, false) >= 0 )
     {
-        if ( _dpd.streamAPI->get_application_protocol_id(p->stream_session_ptr)
+        if ( _dpd.sessionAPI->get_application_protocol_id(p->stream_session)
             == ftp_data_app_id )
         {
             PROFILE_VARS;
@@ -225,6 +232,13 @@ void FTPTelnetCleanExit(int sig, void *args)
 
 extern char* mystrtok (char* s, const char* delim);
 
+#ifdef REG_TEST
+static inline void PrintFTPSize(void)
+{
+    _dpd.logMsg("\nFTP Session Size: %lu\n", (long unsigned int)sizeof(FTP_SESSION));
+}
+#endif
+
 static void FTPTelnetInit(struct _SnortConfig *sc, char *args)
 {
     char  *pcToken;
@@ -235,6 +249,10 @@ static void FTPTelnetInit(struct _SnortConfig *sc, char *args)
     FTPTELNET_GLOBAL_CONF *pPolicyConfig = NULL;
 
     ErrorString[0] = '\0';
+
+#ifdef REG_TEST
+    PrintFTPSize();
+#endif
 
     if ((args == NULL) || (strlen(args) == 0))
     {
@@ -262,14 +280,18 @@ static void FTPTelnetInit(struct _SnortConfig *sc, char *args)
                                             "FTP/Telnet configuration.\n");
         }
 
-        _dpd.addPreprocExit(FTPTelnetCleanExit, NULL, PRIORITY_SESSION, PP_FTPTELNET);
-        _dpd.addPreprocReset(FTPTelnetReset, NULL, PRIORITY_SESSION, PP_FTPTELNET);
-        _dpd.addPreprocResetStats(FTPTelnetResetStats, NULL, PRIORITY_SESSION, PP_FTPTELNET);
+        _dpd.addPreprocExit(FTPTelnetCleanExit, NULL, PRIORITY_APPLICATION, PP_FTPTELNET);
+        _dpd.addPreprocReset(FTPTelnetReset, NULL, PRIORITY_APPLICATION, PP_FTPTELNET);
+        _dpd.addPreprocResetStats(FTPTelnetResetStats, NULL, PRIORITY_APPLICATION, PP_FTPTELNET);
         _dpd.addPreprocConfCheck(sc, FTPConfigCheck);
+        _dpd.registerPreprocStats("ftp_telnet", FTPTelnetStats);
 
 #ifdef PERF_PROFILING
-        _dpd.addPreprocProfileFunc("ftptelnet_ftp", (void*)&ftpPerfStats, 0, _dpd.totalPerfStats);
-        _dpd.addPreprocProfileFunc("ftptelnet_telnet", (void*)&telnetPerfStats, 0, _dpd.totalPerfStats);
+        _dpd.addPreprocProfileFunc("ftptelnet_ftp", (void*)&ftpPerfStats, 0, _dpd.totalPerfStats, NULL);
+        _dpd.addPreprocProfileFunc("ftptelnet_telnet", (void*)&telnetPerfStats, 0, _dpd.totalPerfStats, NULL);
+#ifdef TARGET_BASED
+        _dpd.addPreprocProfileFunc("ftptelnet_ftpdata", (void*)&ftpdataPerfStats, 0, _dpd.totalPerfStats, NULL);
+#endif
 #endif
 
 #ifdef TARGET_BASED
@@ -280,6 +302,11 @@ static void FTPTelnetInit(struct _SnortConfig *sc, char *args)
             ftp_data_app_id = _dpd.addProtocolReference("ftp-data");
             telnet_app_id = _dpd.addProtocolReference("telnet");
         }
+
+        // register with session to handle applications
+        _dpd.sessionAPI->register_service_handler( PP_FTPTELNET, ftp_app_id );
+        _dpd.sessionAPI->register_service_handler( PP_FTPTELNET, ftp_data_app_id );
+        _dpd.sessionAPI->register_service_handler( PP_FTPTELNET, telnet_app_id );
 #endif
     }
 
@@ -342,6 +369,8 @@ static void FTPTelnetInit(struct _SnortConfig *sc, char *args)
     else if (strcasecmp(pcToken, TELNET) == 0)
     {
         iRet = ProcessTelnetConf(pPolicyConfig, ErrorString, iErrStrLen);
+        enableFtpTelnetPortStreamServices( sc, &pPolicyConfig->telnet_config->proto_ports, NULL,
+                                           SSN_DIR_FROM_SERVER | SSN_DIR_FROM_CLIENT ); 
     }
     else if (strcasecmp(pcToken, FTP) == 0)
     {
@@ -355,11 +384,11 @@ static void FTPTelnetInit(struct _SnortConfig *sc, char *args)
         }
         else if (strcasecmp(pcToken, SERVER) == 0)
         {
-            iRet = ProcessFTPServerConf(pPolicyConfig, ErrorString, iErrStrLen);
+            iRet = ProcessFTPServerConf(sc, pPolicyConfig, ErrorString, iErrStrLen);
         }
         else if (strcasecmp(pcToken, CLIENT) == 0)
         {
-            iRet = ProcessFTPClientConf(pPolicyConfig, ErrorString, iErrStrLen);
+            iRet = ProcessFTPClientConf(sc, pPolicyConfig, ErrorString, iErrStrLen);
         }
         else
         {
@@ -448,6 +477,9 @@ void SetupFTPTelnet(void)
 
     DEBUG_WRAP(DebugMessage(DEBUG_FTPTELNET, "Preprocessor: FTPTelnet is "
                 "setup . . .\n"););
+#ifdef DUMP_BUFFER
+    _dpd.registerBufferTracer(getFTPTelnetBuffers, FTPTELNET_BUFFER_DUMP_FUNC);
+#endif
 }
 
 static void FTPTelnetReset(int signal, void *data)
@@ -458,6 +490,25 @@ static void FTPTelnetReset(int signal, void *data)
 static void FTPTelnetResetStats(int signal, void *data)
 {
     return;
+}
+
+static void FTPTelnetStats(int exiting)
+{
+    _dpd.logMsg("FTPTelnet Preprocessor Statistics\n");
+    _dpd.logMsg("  Current active FTP sessions                   : " STDu64 "\n",
+                ftp_telnet_stats.ftp_sessions);
+    _dpd.logMsg("  Max concurrent FTP sessions                   : " STDu64 "\n",
+                ftp_telnet_stats.max_ftp_sessions);
+    _dpd.logMsg("  Total FTP Data sessions                       : " STDu64 "\n",
+                ftp_telnet_stats.ftp_data_sessions);
+    _dpd.logMsg("  Max concurrent FTP Data sessions              : " STDu64 "\n",
+                ftp_telnet_stats.max_ftp_data_sessions);
+    _dpd.logMsg("  Current active Telnet sessions                : " STDu64 "\n",
+                ftp_telnet_stats.telnet_sessions);
+    _dpd.logMsg("  Max concurrent Telnet sessions                : " STDu64 "\n",
+                ftp_telnet_stats.max_telnet_sessions);
+    _dpd.logMsg("  Current ftp_telnet session non-mempool memory : " STDu64 "\n",
+                ftp_telnet_stats.heap_memory);
 }
 
 #ifdef SNORT_RELOAD
@@ -536,6 +587,8 @@ static void _FtpTelnetReload(struct _SnortConfig *sc, tSfPolicyUserContextId ftp
     else if (strcasecmp(pcToken, TELNET) == 0)
     {
         iRet = ProcessTelnetConf(pPolicyConfig, ErrorString, iErrStrLen);
+        enableFtpTelnetPortStreamServices( sc, &pPolicyConfig->telnet_config->proto_ports, NULL,
+                                           SSN_DIR_FROM_SERVER | SSN_DIR_FROM_CLIENT ); 
     }
     else if (strcasecmp(pcToken, FTP) == 0)
     {
@@ -549,11 +602,11 @@ static void _FtpTelnetReload(struct _SnortConfig *sc, tSfPolicyUserContextId ftp
         }
         else if (strcasecmp(pcToken, SERVER) == 0)
         {
-            iRet = ProcessFTPServerConf(pPolicyConfig, ErrorString, iErrStrLen);
+            iRet = ProcessFTPServerConf(sc, pPolicyConfig, ErrorString, iErrStrLen);
         }
         else if (strcasecmp(pcToken, CLIENT) == 0)
         {
-            iRet = ProcessFTPClientConf(pPolicyConfig, ErrorString, iErrStrLen);
+            iRet = ProcessFTPClientConf(sc, pPolicyConfig, ErrorString, iErrStrLen);
         }
         else
         {
@@ -649,6 +702,7 @@ static int FtpTelnetReloadVerifyPolicy(
 static int FtpTelnetReloadVerify(struct _SnortConfig *sc, void *new_config)
 {
     tSfPolicyUserContextId ftp_telnet_swap_config = (tSfPolicyUserContextId)new_config;
+
     if (ftp_telnet_swap_config == NULL)
         return 0;
 

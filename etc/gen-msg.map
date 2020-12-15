@@ -167,6 +167,7 @@
 116 || 296 || snort_decoder: WARNING: IPv6 packet includes out-of-order extension headers
 116 || 297 || snort_decoder: WARNING: Two or more GTP encapsulation layers are present
 116 || 298 || snort_decoder: WARNING: GTP header length is invalid
+116 || 300 || snort_decoder: WARNING: Too many levels for decoding 
 116 || 400 || snort_decoder: WARNING: XMAS Attack Detected
 116 || 401 || snort_decoder: WARNING: Nmap XMAS Attack Detected
 116 || 402 || snort_decoder: WARNING: DOS NAPTHA Vulnerability Detected
@@ -232,6 +233,7 @@
 116 || 462 || snort_decoder: WARNING: ERSpan Header version mismatch
 116 || 463 || snort_decoder: WARNING: captured < ERSpan Type2 Header Length
 116 || 464 || snort_decoder: WARNING: captured < ERSpan Type3 Header Length
+116 || 467 || snort_decoder: WARNING: truncated FabricPath header
 117 || 1 || spp_portscan2: Portscan detected
 118 || 1 || spp_conversation: Bad IP protocol
 119 || 1 || http_inspect: ASCII ENCODING
@@ -268,6 +270,9 @@
 119 || 32 || http_inspect: SIMPLE REQUEST
 119 || 33 || http_inspect: UNESCAPED SPACE IN HTTP URI 
 119 || 34 || http_inspect: TOO MANY PIPELINED REQUESTS
+119 || 36 || http_inspect: INVALID RANGE UNIT FORMAT
+119 || 37 || http_inspect: RANGE FIELD PRESENT IN NON GET METHOD
+119 || 38 || http_inspect: ERROR IN RANGE FIELD OF REQUEST HEADER
 120 || 1 || http_inspect: ANOMALOUS HTTP SERVER ON UNDEFINED HTTP PORT
 120 || 2 || http_inspect: INVALID STATUS CODE IN HTTP RESPONSE
 120 || 3 || http_inspect: NO CONTENT-LENGTH OR TRANSFER-ENCODING IN HTTP RESPONSE
@@ -279,6 +284,26 @@
 120 || 9 || http_inspect: JAVASCRIPT OBFUSCATION LEVELS EXCEEDS 1
 120 || 10 || http_inspect: JAVASCRIPT WHITESPACES EXCEEDS MAX ALLOWED
 120 || 11 || http_inspect: MULTIPLE ENCODINGS WITHIN JAVASCRIPT OBFUSCATED DATA
+120 || 12 || http_inspect: SWF FILE ZLIB DECOMPRESSION FAILURE
+120 || 13 || http_inspect: SWF FILE LZMA DECOMPRESSION FAILURE
+120 || 14 || http_inspect: PDF FILE DEFLATE DECOMPRESSION FAILURE
+120 || 15 || http_inspect: PDF FILE UNSUPPORTED COMPRESSION TYPES
+120 || 16 || http_inspect: PDF FILE CASCADED COMPRESSION
+120 || 17 || http_inspect: PDF FILE PARSE FAILURE
+120 || 18 || http_inspect: PROTOCOL-OTHER HTTP server response before client request
+120 || 19 || http_inspect: MULTIPLE CONTENT LENGTH IN HTTP RESPONSE
+120 || 20 || http_inspect: MULTIPLE CONTENT ENCODING IN HTTP RESPONSE
+120 || 21 || http_inspect: MULTIPLE COLON BETWEEN KEY AND VALUE IN HTTP RESPONSE HEADER
+120 || 22 || http_inspect: INVALID CHARACTER BETWEEN KEY AND VALUE IN HTTP RESPONSE HEADER
+120 || 23 || http_inspect: TRANSFER ENCODING:CHUNKED IN HTTP 1.0 REQUEST/RESPONSE HEADER
+120 || 24 || http_inspect: PARTIAL DECOMPRESSION FAILURE IN HTTP RESPONSE BODY
+120 || 25 || http_inspect: INVALID HEADER FOLDING
+120 || 26 || http_inspect: JUNK LINE BEFORE HTTP RESPONSE HEADER
+120 || 27 || http_inspect: NO END OF HEADER IN HTTP RESPONSE
+120 || 28 || http_inspect: INVALID CHUNK SIZE OR CHUNK SIZE FOLLOWED BY JUNK CHARACTERS 
+120 || 29 || http_inspect: INVALID VERSION IN HTTP RESPONSE HEADER 
+120 || 30 || http_inspect: INVALID CONTENT RANGE UNIT FORMAT 
+120 || 31 || http_inspect: ERROR IN RANGE FIELD OF RESPONSE HEADER 
 121 || 1 || flow-portscan: Fixed Scale Scanner Limit Exceeded
 121 || 2 || flow-portscan: Sliding Scale Scanner Limit Exceeded
 121 || 3 || flow-portscan: Fixed Scale Talker Limit Exceeded
@@ -437,6 +462,8 @@
 133 || 55 || dcerpc2: SMB - Invalid setup count
 133 || 56 || dcerpc2: SMB - Client attempted multiple dialect negotiations on session
 133 || 57 || dcerpc2: SMB - Client attempted to create or set a file's attributes to readonly/hidden/system
+133 || 58 || dcerpc2: SMB - File offset provided is greater than file size specified
+133 || 59 || dcerpc2: SMB - Nextcommand specified in SMB2 header is beyond payload boundary
 134 || 1 || ppm: rule tree disabled
 134 || 2 || ppm: rule tree enabled
 134 || 3 || ppm: packet aborted
@@ -445,8 +472,10 @@
 135 || 3 || internal: session cleared
 136 || 1 || reputation: Packet is blacklisted
 136 || 2 || reputation: Packet is whitelisted
-137 || 1 || ssp_ssl: Invalid Client HELLO after Server HELLO Detected
-137 || 2 || ssp_ssl: Invalid Server HELLO without Client HELLO Detected
+137 || 1 || spp_ssl: Invalid Client HELLO after Server HELLO Detected
+137 || 2 || spp_ssl: Invalid Server HELLO without Client HELLO Detected
+137 || 3 || spp_ssl: Heartbeat Read Overrun Attempt Detected
+137 || 4 || spp_ssl: Large Heartbeat Response Detected
 138 || 2 || sensitive_data: sensitive data - Credit card numbers
 138 || 3 || sensitive_data: sensitive data - U.S. social security numbers with dashes
 138 || 4 || sensitive_data: sensitive data - U.S. social security numbers without dashes

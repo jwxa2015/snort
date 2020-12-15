@@ -1,6 +1,6 @@
 /****************************************************************************
  *
- * Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+ * Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
  * Copyright (C) 2003-2013 Sourcefire, Inc.
  *
  * This program is free software; you can redistribute it and/or modify
@@ -101,7 +101,6 @@
 #include "snort_debug.h"
 #include "sfxhash.h"
 #include "sfprimetable.h"
-#include "util.h"
 
 /**@defgroup sfxhash sourcefire.container.sfxhash
  * Implements SFXHASH as specialized hash container
@@ -174,35 +173,26 @@ int sfxhash_calcrows(int num)
  */
 /*
   Notes:
-  if nrows < 0 don't cal the nearest prime.
+  if nrows < 0 don't cal the nearest powerof2.
   datasize must be the same for all entries, unless datasize is zero.
   maxmem of 0 indicates no memory limits.
 
 */
-SFXHASH * sfxhash_new( int nrows, int keysize, int datasize, unsigned long maxmem,
+SFXHASH * sfxhash_new( unsigned nrows, int keysize, int datasize, unsigned long maxmem,
                        int anr_flag,
-                       int (*anrfree)(void * key, void * data),
-                       int (*usrfree)(void * key, void * data),
+                       SFXHASH_FREE_FCN anrfree,
+                       SFXHASH_FREE_FCN usrfree,
                        int recycle_flag )
 {
-    int       i;
+    unsigned int i;
     SFXHASH * h;
 
-    if( nrows > 0 ) /* make sure we have a prime number */
-    {
-//        nrows = sf_nearest_prime( nrows );
-        /* If nrows is not a power of two, need to find the
-         * next highest power of two */
-        nrows = sfxhash_nearest_powerof2(nrows);
-    }
-    else   /* use the magnitude of nrows as is */
-    {
-        nrows = -nrows;
-    }
+    /* If nrows is not a power of two, need to find the
+     * next highest power of two */
+    nrows = sfxhash_nearest_powerof2(nrows);
 
     /* Allocate the table structure from general memory */
-    //h = (SFXHASH*) calloc( 1, sizeof(SFXHASH) );
-    h = (SFXHASH*)SnortAlloc(sizeof(SFXHASH));
+    h = (SFXHASH*)calloc(1, sizeof(SFXHASH));
     if( !h )
     {
         return 0;
@@ -325,6 +315,7 @@ void sfxhash_delete_free_list(SFXHASH *t)
 
     t->fhead = NULL;
     t->ftail = NULL;
+    t->anr_count = 0;
 }
 
 /*!
@@ -433,6 +424,7 @@ void sfxhash_save_free_node( SFXHASH *t, SFXHASH_NODE * hnode )
         t->fhead    = hnode;
         t->ftail    = hnode;
     }
+    t->anr_count++;
 }
 
 /**Get a previously freed node for reuse.
@@ -443,14 +435,15 @@ SFXHASH_NODE * sfxhash_get_free_node( SFXHASH *t )
     SFXHASH_NODE * node = t->fhead;
 
     /* Remove A Node from the Free Node List - remove the head node */
-    if( t->fhead  )
+    if( node  )
     {
-        t->fhead = t->fhead->gnext;
+        t->fhead = node->gnext;
         if( t->fhead )
             t->fhead->gprev = 0;
 
         if( t->ftail  == node ) /* no more nodes - clear the tail */
             t->ftail  =  0;
+        t->anr_count--;
     }
 
     return node;
@@ -480,6 +473,11 @@ void sfxhash_glink_node( SFXHASH *t, SFXHASH_NODE * hnode )
 static
 void sfxhash_gunlink_node( SFXHASH *t, SFXHASH_NODE * hnode )
 {
+    if( t->gnode == hnode ) /* if this was the global next node */
+    {
+        t->gnode = hnode->gnext;
+    }
+
     /* Remove the Head Node */
     if( t->ghead == hnode ) /* add the node to head of the the existing list */
     {
@@ -561,6 +559,7 @@ static void movetofront( SFXHASH *t, SFXHASH_NODE * n )
     }
 
     /* Move node in the global hash node list to the front */
+    if (n == t->gnode) t->gnode = n->gnext;
     sfxhash_gmovetofront( t, n );
 }
 
@@ -698,7 +697,7 @@ SFXHASH_NODE * sfxhash_find_node_row( SFXHASH * t, const void * key, int * rinde
  * @retval SFXHASH_INTABLE already in the table, t->cnode points to the node
  * @retval SFXHASH_NOMEM   not enough memory
  */
-int sfxhash_add( SFXHASH * t, void * key, void * data )
+static int sfxhash_add_ex( SFXHASH * t, const void * key, void* data , void **data_ptr)
 {
     int            index;
     SFXHASH_NODE * hnode;
@@ -709,7 +708,8 @@ int sfxhash_add( SFXHASH * t, void * key, void * data )
     if( hnode )
     {
         t->cnode = hnode;
-
+        if (data_ptr)
+            *data_ptr = hnode->data;
         return SFXHASH_INTABLE; /* found it - return it. */
     }
 
@@ -741,6 +741,8 @@ int sfxhash_add( SFXHASH * t, void * key, void * data )
         {
            memcpy(hnode->data,data,t->datasize);
         }
+        if (data_ptr)
+            *data_ptr = hnode->data;
     }
     else
     {
@@ -756,9 +758,15 @@ int sfxhash_add( SFXHASH * t, void * key, void * data )
     /* Track # active nodes */
     t->count++;
 
+    t->cnode = hnode;
+
     return SFXHASH_OK;
 }
 
+int sfxhash_add( SFXHASH * t, void * key, void * data)
+{
+    return sfxhash_add_ex( t, key, data , NULL);
+}
 
 /*!
  * Add a key to the hash table, return the hash node
@@ -814,7 +822,7 @@ SFXHASH_NODE * sfxhash_get_node( SFXHASH * t, const void * key )
     if( t->datasize )
     {
         /* Set up the new data pointer */
-        hnode->data= (char*)hnode + sizeof(SFXHASH_NODE) + t->pad + t->keysize;
+        hnode->data = (char*)hnode + sizeof(SFXHASH_NODE) + t->pad + t->keysize;
     }
     else
     {
@@ -906,6 +914,41 @@ SFXHASH_NODE *sfxhash_gnext( SFXHASH_NODE *n )
         return n->gnext;
     }
 
+    return NULL;
+}
+
+/**
+ * Walk the global list
+ *
+ * @param n current node
+ *
+ * @return the next node in the list or NULL when at the end
+ */
+SFXHASH_NODE *sfxhash_gfindnext( SFXHASH * t )
+{
+    SFXHASH_NODE *n;
+
+    n = t->gnode;
+    if (n) t->gnode = n->gnext;
+    return n;
+}
+
+
+/**
+ * Get the HEAD of the in use list
+ *
+ * @param t table pointer
+ *
+ * @return the head of the list or NULL
+ */
+SFXHASH_NODE *sfxhash_gfindfirst( SFXHASH * t )
+{
+    if(t)
+    {
+        if (t->ghead) t->gnode = t->ghead->gnext;
+        else t->gnode = NULL;
+        return t->ghead;
+    }
     return NULL;
 }
 
@@ -1038,7 +1081,7 @@ int sfxhash_free_node( SFXHASH * t, SFXHASH_NODE * hnode)
 
     if( t->usrfree )
     {
-        t->usrfree( hnode->key, hnode->data );
+        t->usrfree( hnode->key, hnode->data);
     }
 
     if( t->recycle_nodes )
@@ -1051,6 +1094,67 @@ int sfxhash_free_node( SFXHASH * t, SFXHASH_NODE * hnode)
     }
 
     return SFXHASH_OK;
+}
+
+/*
+ *  Unlink and free an ANR node or the oldest node, if ANR is empty
+ *  behavior is undefined if t->usrfree is set
+ */
+int sfxhash_free_anr_lru( SFXHASH * t )
+{
+    if (!t)
+        return SFXHASH_ERR;
+    if (t->fhead)
+    {
+        SFXHASH_NODE* fn = sfxhash_get_free_node(t);
+        if (fn)
+        {
+            s_free(t, fn);
+            return SFXHASH_OK;
+        }
+    }
+    if (t->gtail)
+    {
+        if (SFXHASH_OK == sfxhash_free_node(t, t->gtail))
+        {
+            if (t->fhead)
+            {
+                SFXHASH_NODE* fn = sfxhash_get_free_node(t);
+                if (fn)
+                {
+                    s_free(t, fn);
+                    return SFXHASH_OK;
+                }
+            }
+            //sfxhash_free_node calls s_free for us
+            //when these conditions are met so we should
+            //return SFXHASH_OK
+            else if (!t->recycle_nodes)
+            {
+                return SFXHASH_OK;
+            }
+        }
+    }
+    return SFXHASH_ERR;
+}
+
+/*
+ *  Unlink and free an ANR node
+ */
+int sfxhash_free_anr( SFXHASH * t )
+{
+    if (!t)
+        return SFXHASH_ERR;
+    if (t->fhead)
+    {
+        SFXHASH_NODE* fn = sfxhash_get_free_node(t);
+        if (fn)
+        {
+            s_free(t, fn);
+            return SFXHASH_OK;
+        }
+    }
+    return SFXHASH_ERR;
 }
 
 /*!
@@ -1200,14 +1304,98 @@ int sfxhash_set_keyops( SFXHASH *h ,
     return -1;
 }
 
+int sfxhash_add_return_data_ptr( SFXHASH * t, const void * key, void **data )
+{
+    if( !t->datasize )
+        return SFXHASH_ERR;
+
+    *data = NULL;
+
+    return sfxhash_add_ex(t, key, NULL, data);
+}
+
+/*
+ * Calculate memcap size based on number of entries and per-entry cost
+ *
+ * @param num_entries number of entries
+ * @param entry_cost cost of a single entry
+ *
+ * @return memcap size
+ */
+unsigned sfxhash_calc_maxmem(unsigned num_entries, unsigned entry_cost)
+{
+	return num_entries * (entry_cost + sizeof(SFXHASH_NODE) + sizeof(long));
+}
+
+/*
+ * Try to decrease the memcap
+ *      First decrease memcap, then delete free list, then kick out lru nodes
+ *  Behavior is undefined when t->usrfree is set
+ *
+ * @param t             SFXHASH table pointer
+ * @param new_memcap    the new desired memcap
+ * @param max_work      the maximum amount of work for the function to do (0 = do all available work)
+ *
+ * @return SFXHASH_OK           when memcap is successfully decreased
+ * @return SFXHASH_PENDING      when more work needs to be done
+ * @return SFXHASH_NOMEM        when there isn't enough memory in the hash table
+ * #return SFXHASH_ERR          when an error has occurred
+ */
+int sfxhash_change_memcap( SFXHASH * t, unsigned long new_memcap, unsigned *max_work )
+{
+    unsigned work = 0;
+
+    if (!t)
+        return SFXHASH_ERR;
+
+    if (new_memcap == t->mc.memcap)
+    {
+        return SFXHASH_OK;
+    }
+
+    if (new_memcap > t->mc.memcap)
+    {
+        t->mc.memcap = new_memcap;
+        return SFXHASH_OK;
+    }
+
+    //memcap decreased
+
+    if (new_memcap < t->overhead_bytes)
+        return SFXHASH_ERR;
+
+    while (new_memcap < t->mc.memused
+            && (work < *max_work || *max_work == 0)
+            && sfxhash_free_anr_lru(t) == SFXHASH_OK)
+        work++;
+
+    if (work == *max_work && new_memcap < t->mc.memused)
+    {
+	*max_work -= work;
+        return SFXHASH_PENDING;
+    }
+
+	*max_work -= work;
+
+    //else mem decrased or we ran out of work (no more nodes to free)
+
+    //we ran out of nodes to free and there still isnt enough memory
+    //or (we have undefined behavior: t->usrfree is set and sfxhash_free_anr_lru is returning SFXHASH_ERR)
+    if (new_memcap < t->mc.memused)
+        return SFXHASH_NOMEM;
+
+    t->mc.memcap = new_memcap;
+
+    return SFXHASH_OK;
+}
 
 /*
  * -----------------------------------------------------------------------------------------
  *   Test Driver for Hashing
  * -----------------------------------------------------------------------------------------
  */
-#ifdef SFXHASH_MAIN
 
+#ifdef SFXHASH_MAIN
 
 /*
    This is called when the user releases a node or kills the table

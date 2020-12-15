@@ -1,5 +1,5 @@
 /*
-** Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+** Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
 ** Copyright (C) 2012-2013 Sourcefire, Inc.
 **
 ** This program is free software; you can redistribute it and/or modify
@@ -29,11 +29,12 @@
 #include "sf_dynamic_common.h"
 #include "sfPolicy.h"
 #include "obfuscation.h"
+#include "session_api.h"
 #include "stream_api.h"
 #include <daq.h>
 
 #define OUTPUT_DATA_MAJOR_VERSION 2
-#define OUTPUT_DATA_MINOR_VERSION 1
+#define OUTPUT_DATA_MINOR_VERSION 2
 
 typedef int (*OutputInitFunc)(void*);
 
@@ -46,6 +47,7 @@ typedef int (*getConfigValueFunc)(void);
 typedef int (*TextLog_FlushFunc)(void*);
 typedef void (*TextLog_TermFunc) (void* );
 typedef int (*TextLog_PrintFunc)(void*, const char* format, ...);
+typedef int (*TextLog_PrintUnicodeFunc)(void*, uint8_t *, uint32_t, uint8_t);
 typedef int (*GetConfigValueFunc)(void);
 typedef int (*TextLog_NewLineFunc) (void* );
 typedef int (*TextLog_PutcFunc)(void*, char);
@@ -106,6 +108,7 @@ typedef struct _DynamicOutputData
     TextLog_PutsFunc textLog_Quote;
     TextLog_WriteFunc textLog_Write;
     TextLog_PrintFunc textLog_Print;
+    TextLog_PrintUnicodeFunc textLog_PrintUnicode;
     TextLog_FlushFunc textLog_Flush;
     TextLog_NewLineFunc textLog_NewLine;
     TextLog_PutsFunc textLog_Puts;
@@ -143,12 +146,14 @@ typedef struct _DynamicOutputData
     DebugMsgFunc debugMsg;
     SnortStrdupFunc SnortStrdup;
     SnortSnprintfFunc SnortSnprintf;
-    GetPolicyFunc getRuntimePolicy;
+    GetPolicyFunc getNapRuntimePolicy;
+    GetPolicyFunc getIpsRuntimePolicy;
     GetParserPolicyFunc getParserPolicy;
     GetPolicyFunc getDefaultPolicy;
     GetBasePolicyVersionFunc getBasePolicyVersion;
     GetTargetPolicyVersionFunc getTargetPolicyVersion;
     ObfuscationApi *obApi;
+    SessionAPI **sessionAPI;
     StreamAPI **streamAPI;
     GetDAQInterfaceMode getDAQInterfaceMode;
 

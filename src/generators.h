@@ -1,6 +1,6 @@
 /* $Id$ */
 /*
-** Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+** Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
 ** Copyright (C) 2002-2013 Sourcefire, Inc.
 ** Copyright (C) 1998-2002 Martin Roesch <roesch@sourcefire.com>
 **
@@ -153,6 +153,8 @@
 #define     DECODE_GTP_MULTIPLE_ENCAPSULATION     297
 #define     DECODE_GTP_BAD_LEN                    298
 
+#define     DECODE_DECODING_DEPTH_EXCEEDED        300
+
 //-----------------------------------------------------
 // remember to add rules to preproc_rules/decoder.rules
 // add the new decoder rules to the following enum.
@@ -226,6 +228,11 @@ enum {
     DECODE_ERSPAN3_DGRAM_LT_HDR,
     DECODE_AUTH_HDR_TRUNC,
     DECODE_AUTH_HDR_BAD_LEN,
+    DECODE_FPATH_HDR_TRUNC,
+    DECODE_CISCO_META_HDR_TRUNC,
+    DECODE_CISCO_META_HDR_OPT_LEN,
+    DECODE_CISCO_META_HDR_OPT_TYPE,
+    DECODE_CISCO_META_HDR_SGT,
     DECODE_INDEX_MAX
 };
 
@@ -280,6 +287,10 @@ enum {
 #define     HI_CLIENT_UNESCAPED_SPACE_URI           33
 #define     HI_CLIENT_PIPELINE_MAX                  34
 
+#define     HI_CLIENT_INVALID_RANGE_UNIT_FMT        36
+#define     HI_CLIENT_RANGE_NON_GET_METHOD          37
+#define     HI_CLIENT_RANGE_FIELD_ERROR             38
+
 // these are either server specific or both client / server
 #define GENERATOR_SPP_HTTP_INSPECT                 120 
 #define     HI_ANOM_SERVER_ALERT                    1   /* done */
@@ -293,6 +304,15 @@ enum {
 #define     HI_SERVER_JS_OBFUSCATION_EXCD           9 
 #define     HI_SERVER_JS_EXCESS_WS                  10 
 #define     HI_SERVER_MIXED_ENCODINGS               11
+#define     HI_SERVER_SWF_ZLIB_FAILURE              12
+#define     HI_SERVER_SWF_LZMA_FAILURE              13
+#define     HI_SERVER_PDF_DEFLATE_FAILURE           14
+#define     HI_SERVER_PDF_UNSUP_COMP_TYPE           15
+#define     HI_SERVER_PDF_CASC_COMP                 16
+#define     HI_SERVER_PDF_PARSE_FAILURE             17
+
+#define     HI_SERVER_INVALID_CONTENT_RANGE_UNIT_FMT 30
+#define     HI_SERVER_RANGE_FIELD_ERROR             31
 
 
 #define GENERATOR_PSNG                             122
@@ -401,27 +421,27 @@ enum {
 #define     SSH_EVENT_PAYLOAD_SIZE             6
 #define     SSH_EVENT_VERSION                  7
 
-#define GENERATOR_SPP_STREAM5                     129
-#define     STREAM5_SYN_ON_EST                      1
-#define     STREAM5_DATA_ON_SYN                     2
-#define     STREAM5_DATA_ON_CLOSED                  3
-#define     STREAM5_BAD_TIMESTAMP                   4
-#define     STREAM5_BAD_SEGMENT                     5
-#define     STREAM5_WINDOW_TOO_LARGE                6
-#define     STREAM5_EXCESSIVE_TCP_OVERLAPS          7
-#define     STREAM5_DATA_AFTER_RESET                8
-#define     STREAM5_SESSION_HIJACKED_CLIENT         9
-#define     STREAM5_SESSION_HIJACKED_SERVER        10
-#define     STREAM5_DATA_WITHOUT_FLAGS             11
-#define     STREAM5_SMALL_SEGMENT                  12
-#define     STREAM5_4WAY_HANDSHAKE                 13
-#define     STREAM5_NO_TIMESTAMP                   14
-#define     STREAM5_BAD_RST                        15
-#define     STREAM5_BAD_FIN                        16
-#define     STREAM5_BAD_ACK                        17
-#define     STREAM5_DATA_AFTER_RST_RCVD            18
-#define     STREAM5_WINDOW_SLAM                    19
-#define     STREAM5_NO_3WHS                        20
+#define GENERATOR_SPP_STREAM                     129
+#define     STREAM_SYN_ON_EST                      1
+#define     STREAM_DATA_ON_SYN                     2
+#define     STREAM_DATA_ON_CLOSED                  3
+#define     STREAM_BAD_TIMESTAMP                   4
+#define     STREAM_BAD_SEGMENT                     5
+#define     STREAM_WINDOW_TOO_LARGE                6
+#define     STREAM_EXCESSIVE_TCP_OVERLAPS          7
+#define     STREAM_DATA_AFTER_RESET                8
+#define     STREAM_SESSION_HIJACKED_CLIENT         9
+#define     STREAM_SESSION_HIJACKED_SERVER        10
+#define     STREAM_DATA_WITHOUT_FLAGS             11
+#define     STREAM_SMALL_SEGMENT                  12
+#define     STREAM_4WAY_HANDSHAKE                 13
+#define     STREAM_NO_TIMESTAMP                   14
+#define     STREAM_BAD_RST                        15
+#define     STREAM_BAD_FIN                        16
+#define     STREAM_BAD_ACK                        17
+#define     STREAM_DATA_AFTER_RST_RCVD            18
+#define     STREAM_WINDOW_SLAM                    19
+#define     STREAM_NO_3WHS                        20
 
 #define GENERATOR_DNS                             131
 #define     DNS_EVENT_OBSOLETE_TYPES                1
@@ -488,6 +508,8 @@ enum {
 #define     DCE2_EVENT__SMB_INVALID_SETUP_COUNT      55
 #define     DCE2_EVENT__SMB_MULTIPLE_NEGOTIATIONS    56
 #define     DCE2_EVENT__SMB_EVASIVE_FILE_ATTRS       57
+#define     DCE2_EVENT__SMB_INVALID_FILE_OFFSET      58
+#define     DCE2_EVENT__SMB_BAD_NEXT_COMMAND_OFFSET  59
 
 #define GENERATOR_PPM                               134
 #define     PPM_EVENT_RULE_TREE_DISABLED              1
@@ -519,6 +541,9 @@ enum {
 
 // #define GENERATOR_FILE_TYPE                      146 //Defined in file_service.h
 // #define GENERATOR_FILE_SIGNATURE                 147 //Defined in file_service.h
+
+#define GENERATOR_SPP_CIP                           148
+#define GENERATOR_SPP_S7COMMPLUS                    149
 
 
 /*  This is where all the alert messages will be archived for each
@@ -558,29 +583,29 @@ enum {
 #define FRAG3_EXCESSIVE_OVERLAP_STR "(spp_frag3) Excessive fragment overlap"
 #define FRAG3_TINY_FRAGMENT_STR "(spp_frag3) Tiny fragment"
 
-/*   Stream5 strings */
-#define STREAM5_SYN_ON_EST_STR "Syn on established session"
-#define STREAM5_DATA_ON_SYN_STR "Data on SYN packet"
-#define STREAM5_DATA_ON_CLOSED_STR "Data sent on stream not accepting data"
-#define STREAM5_BAD_TIMESTAMP_STR "TCP Timestamp is outside of PAWS window"
-#define STREAM5_BAD_SEGMENT_STR "Bad segment, adjusted size <= 0"
-#define STREAM5_WINDOW_TOO_LARGE_STR "Window size (after scaling) larger than policy allows"
-#define STREAM5_EXCESSIVE_TCP_OVERLAPS_STR "Limit on number of overlapping TCP packets reached"
-#define STREAM5_DATA_AFTER_RESET_STR "Data sent on stream after TCP Reset sent"
-#define STREAM5_SESSION_HIJACKED_CLIENT_STR "TCP Client possibly hijacked, different Ethernet Address"
-#define STREAM5_SESSION_HIJACKED_SERVER_STR "TCP Server possibly hijacked, different Ethernet Address"
-#define STREAM5_DATA_WITHOUT_FLAGS_STR "TCP Data with no TCP Flags set"
-#define STREAM5_SMALL_SEGMENT_STR "Consecutive TCP small segments exceeding threshold"
-#define STREAM5_4WAY_HANDSHAKE_STR "4-way handshake detected"
-#define STREAM5_NO_TIMESTAMP_STR "TCP Timestamp is missing"
-#define STREAM5_BAD_RST_STR "Reset outside window"
-#define STREAM5_BAD_FIN_STR "FIN number is greater than prior FIN"
-#define STREAM5_BAD_ACK_STR "ACK number is greater than prior FIN"
-#define STREAM5_DATA_AFTER_RST_RCVD_STR "Data sent on stream after TCP Reset received"
-#define STREAM5_WINDOW_SLAM_STR "TCP window closed before receiving data"
-#define STREAM5_NO_3WHS_STR "TCP session without 3-way handshake"
+/*   Stream strings */
+#define STREAM_SYN_ON_EST_STR "Syn on established session"
+#define STREAM_DATA_ON_SYN_STR "Data on SYN packet"
+#define STREAM_DATA_ON_CLOSED_STR "Data sent on stream not accepting data"
+#define STREAM_BAD_TIMESTAMP_STR "TCP Timestamp is outside of PAWS window"
+#define STREAM_BAD_SEGMENT_STR "Bad segment, adjusted size <= 0"
+#define STREAM_WINDOW_TOO_LARGE_STR "Window size (after scaling) larger than policy allows"
+#define STREAM_EXCESSIVE_TCP_OVERLAPS_STR "Limit on number of overlapping TCP packets reached"
+#define STREAM_DATA_AFTER_RESET_STR "Data sent on stream after TCP Reset sent"
+#define STREAM_SESSION_HIJACKED_CLIENT_STR "TCP Client possibly hijacked, different Ethernet Address"
+#define STREAM_SESSION_HIJACKED_SERVER_STR "TCP Server possibly hijacked, different Ethernet Address"
+#define STREAM_DATA_WITHOUT_FLAGS_STR "TCP Data with no TCP Flags set"
+#define STREAM_SMALL_SEGMENT_STR "Consecutive TCP small segments exceeding threshold"
+#define STREAM_4WAY_HANDSHAKE_STR "4-way handshake detected"
+#define STREAM_NO_TIMESTAMP_STR "TCP Timestamp is missing"
+#define STREAM_BAD_RST_STR "Reset outside window"
+#define STREAM_BAD_FIN_STR "FIN number is greater than prior FIN"
+#define STREAM_BAD_ACK_STR "ACK number is greater than prior FIN"
+#define STREAM_DATA_AFTER_RST_RCVD_STR "Data sent on stream after TCP Reset received"
+#define STREAM_WINDOW_SLAM_STR "TCP window closed before receiving data"
+#define STREAM_NO_3WHS_STR "TCP session without 3-way handshake"
 
-#define STREAM5_INTERNAL_EVENT_STR ""
+#define STREAM_INTERNAL_EVENT_STR ""
 
 /* PPM strings */
 #define PPM_EVENT_RULE_TREE_DISABLED_STR "PPM Rule Options Disabled by Rule Latency"
@@ -752,6 +777,11 @@ enum {
 #define DECODE_ERSPAN3_DGRAM_LT_HDR_STR "(snort_decoder) WARNING: captured < ERSpan Type3 Header Length"
 #define DECODE_AUTH_HDR_TRUNC_STR "(snort_decoder) WARNING: truncated authentication header"
 #define DECODE_AUTH_HDR_BAD_LEN_STR "(snort_decoder) WARNING: authentication header bad length"
+#define DECODE_FPATH_HDR_TRUNC_STR "(snort_decoder) WARNING: truncated FabricPath header"
+#define DECODE_CISCO_META_HDR_TRUNC_STR "(snort_decoder) WARNING: truncated Cisco Metadata header"
+#define DECODE_CISCO_META_HDR_OPT_LEN_STR "(snort_decoder) WARNING: Invalid Cisco Metadata option length"
+#define DECODE_CISCO_META_HDR_OPT_TYPE_STR "(snort_decoder) WARNING: Invalid Cisco Metadata option type"
+#define DECODE_CISCO_META_HDR_SGT_STR "(snort_decoder) WARNING: Invalid Cisco Metadata SGT"
 
 /*  RPC decode preprocessor strings */
 #define RPC_FRAG_TRAFFIC_STR "(spp_rpc_decode) Fragmented RPC Records"
@@ -800,5 +830,7 @@ enum {
 #define DECODE_MPLS_RESERVEDLABEL_STR "(snort_decoder) WARNING: MPLS Label 4, 5,.. or 15 Appears in Header"
 #define DECODE_MPLS_LABEL_STACK_STR "(snort_decoder) WARNING: Too Many MPLS headers"
 #define DECODE_MULTICAST_MPLS_STR "(snort_decoder) WARNING: Multicast MPLS traffic detected"
+
+#define DECODE_DECODING_DEPTH_EXCEEDED_STR "(snort_decoder) WARNING: Too many levels for decoding"
 
 #endif /* __GENERATORS_H__ */

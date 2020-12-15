@@ -1,6 +1,6 @@
 /* $Id$ */
 /*
-** Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+** Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
 ** Copyright (C) 2007-2013 Sourcefire, Inc.
 **
 ** This program is free software; you can redistribute it and/or modify
@@ -50,6 +50,7 @@
 #include "sp_byte_check.h"
 #include "sp_byte_jump.h"
 #include "sp_byte_extract.h"
+#include "sp_byte_math.h"
 #include "sp_clientserver.h"
 #include "sp_cvs.h"
 #include "sp_dsize_check.h"
@@ -86,9 +87,7 @@
 #include "sp_ttl_check.h"
 #include "sp_urilen_check.h"
 #include "sp_hdr_opt_wrap.h"
-#if defined(FEAT_FILE_INSPECT)
 # include "sp_file_type.h"
-#endif
 
 #include "sp_preprocopt.h"
 #include "sp_dynamic.h"
@@ -99,6 +98,10 @@
 #include "sfPolicy.h"
 #include "detection_filter.h"
 #include "encode.h"
+#if defined(FEAT_OPEN_APPID)
+#include "stream_common.h"
+#include "sp_appid.h"
+#endif /* defined(FEAT_OPEN_APPID) */
 
 typedef struct _detection_option_key
 {
@@ -128,6 +131,9 @@ uint32_t detection_option_hash_func(SFHASHFCN *p, unsigned char *k, int n)
             break;
         case RULE_OPTION_TYPE_BYTE_EXTRACT:
             hash = ByteExtractHash(key->option_data);
+            break;
+        case RULE_OPTION_TYPE_BYTE_MATH:
+            hash = ByteMathHash(key->option_data);
             break;
         case RULE_OPTION_TYPE_FLOW:
             hash = FlowHash(key->option_data);
@@ -233,11 +239,9 @@ uint32_t detection_option_hash_func(SFHASHFCN *p, unsigned char *k, int n)
         case RULE_OPTION_TYPE_HDR_OPT_CHECK:
             hash = HdrOptCheckHash(key->option_data);
             break;
-#if defined(FEAT_FILE_INSPECT)
         case RULE_OPTION_TYPE_FILE_TYPE:
             hash = FileTypeHash(key->option_data);
             break;
-#endif
         case RULE_OPTION_TYPE_PREPROCESSOR:
             hash = PreprocessorRuleOptionHash(key->option_data);
             break;
@@ -247,6 +251,11 @@ uint32_t detection_option_hash_func(SFHASHFCN *p, unsigned char *k, int n)
         case RULE_OPTION_TYPE_LEAF_NODE:
             hash = 0;
             break;
+#if defined(FEAT_OPEN_APPID)
+        case RULE_OPTION_TYPE_APPID:
+            hash = optionAppIdHash(key->option_data);
+            break;
+#endif /* defined(FEAT_OPEN_APPID) */
     }
 
     return hash;
@@ -285,6 +294,9 @@ int detection_option_key_compare_func(const void *k1, const void *k2, size_t n)
             break;
         case RULE_OPTION_TYPE_BYTE_EXTRACT:
             ret = ByteExtractCompare(key1->option_data, key2->option_data);
+            break;
+        case RULE_OPTION_TYPE_BYTE_MATH:
+            ret = ByteMathCompare(key1->option_data, key2->option_data);
             break;
         case RULE_OPTION_TYPE_FLOW:
             ret = FlowCompare(key1->option_data, key2->option_data);
@@ -390,17 +402,20 @@ int detection_option_key_compare_func(const void *k1, const void *k2, size_t n)
         case RULE_OPTION_TYPE_HDR_OPT_CHECK:
             ret = HdrOptCheckCompare(key1->option_data, key2->option_data);
             break;
-#if defined(FEAT_FILE_INSPECT)
         case RULE_OPTION_TYPE_FILE_TYPE:
             ret = FileTypeCompare(key1->option_data, key2->option_data);
-            break; 
-#endif
+            break;
         case RULE_OPTION_TYPE_PREPROCESSOR:
             ret = PreprocessorRuleOptionCompare(key1->option_data, key2->option_data);
             break;
         case RULE_OPTION_TYPE_DYNAMIC:
             ret = DynamicRuleCompare(key1->option_data, key2->option_data);
             break;
+#if defined(FEAT_OPEN_APPID)
+        case RULE_OPTION_TYPE_APPID:
+            ret = optionAppIdCompare(key1->option_data, key2->option_data);
+            break;
+#endif /* defined(FEAT_OPEN_APPID) */
     }
 
     return ret;
@@ -424,6 +439,9 @@ int detection_hash_free_func(void *option_key, void *data)
             break;
         case RULE_OPTION_TYPE_BYTE_EXTRACT:
             ByteExtractFree(key->option_data);
+            break;
+        case RULE_OPTION_TYPE_BYTE_MATH:
+            ByteMathFree(key->option_data);
             break;
         case RULE_OPTION_TYPE_FLOW:
             free(key->option_data);
@@ -529,11 +547,9 @@ int detection_hash_free_func(void *option_key, void *data)
             break;
         case RULE_OPTION_TYPE_HDR_OPT_CHECK:
             break;
-#if defined(FEAT_FILE_INSPECT)
         case RULE_OPTION_TYPE_FILE_TYPE:
             FileTypeFree(key->option_data);
             break;
-#endif
         case RULE_OPTION_TYPE_PREPROCESSOR:
             PreprocessorRuleOptionsFreeFunc(key->option_data);
             break;
@@ -542,6 +558,11 @@ int detection_hash_free_func(void *option_key, void *data)
             break;
         case RULE_OPTION_TYPE_LEAF_NODE:
             break;
+#if defined(FEAT_OPEN_APPID)
+        case RULE_OPTION_TYPE_APPID:
+            optionAppIdFree(key->option_data);
+            break;
+#endif /* defined(FEAT_OPEN_APPID) */
     }
     return 0;
 }
@@ -765,9 +786,7 @@ char *option_type_str[] =
     "RULE_OPTION_TYPE_IP_TOS",
     "RULE_OPTION_TYPE_IS_DATA_AT",
     "RULE_OPTION_TYPE_FILE_DATA",
-#if defined(FEAT_FILE_INSPECT)
     "RULE_OPTION_TYPE_FILE_TYPE",
-#endif
     "RULE_OPTION_TYPE_BASE64_DECODE",
     "RULE_OPTION_TYPE_BASE64_DATA",
     "RULE_OPTION_TYPE_PKT_DATA",
@@ -791,6 +810,10 @@ char *option_type_str[] =
     "RULE_OPTION_TYPE_HDR_OPT_CHECK",
     "RULE_OPTION_TYPE_PREPROCESSOR",
     "RULE_OPTION_TYPE_DYNAMIC"
+#if defined(FEAT_OPEN_APPID)
+    ,"RULE_OPTION_TYPE_APPID"
+#endif /* defined(FEAT_OPEN_APPID) */
+    ,"RULE_OPTION_TYPE_BYTE_MATH"
 };
 
 #ifdef DEBUG_OPTION_TREE
@@ -845,7 +868,18 @@ int add_detection_option_tree(SnortConfig *sc, detection_option_tree_node_t *opt
     return DETECTION_OPTION_NOT_EQUAL;
 }
 
+
 uint64_t rule_eval_pkt_count = 0;
+
+/* Include "detection_leaf_node.c"
+ *
+ * Service matches, toggles 'check_ports' and then evaluation
+ * of the leaf nodes (ie. the rule header stuffs).
+ *
+ * This defines the routine "detection_leaf_node_eval($,$)" which
+ * is called from the switch case RULE_OPTION_TYPE_LEAF_NODE below.
+ */
+#include "detection_leaf_node.c"
 
 int detection_option_node_evaluate(detection_option_tree_node_t *node, detection_option_eval_data_t *eval_data)
 {
@@ -918,7 +952,7 @@ int detection_option_node_evaluate(detection_option_tree_node_t *node, detection
              * Alt Detect will take precedence over the Alt Decode and/or packet data.
              */
             if(Is_DetectFlag(FLAG_ALT_DETECT))
-                dp = (uint8_t *)DetectBuffer.data;
+                dp = DetectBuffer.data;
             else if(Is_DetectFlag(FLAG_ALT_DECODE))
                 dp = (uint8_t *)DecodeBuffer.data;
             else
@@ -947,7 +981,7 @@ int detection_option_node_evaluate(detection_option_tree_node_t *node, detection
              * Alt Detect will take precedence over the Alt Decode and/or packet data.
              */
             if(Is_DetectFlag(FLAG_ALT_DETECT))
-                dp = (uint8_t *)DetectBuffer.data;
+                dp = DetectBuffer.data;
             else if(Is_DetectFlag(FLAG_ALT_DECODE))
                 dp = (uint8_t *)DecodeBuffer.data;
             else
@@ -967,57 +1001,42 @@ int detection_option_node_evaluate(detection_option_tree_node_t *node, detection
             case RULE_OPTION_TYPE_LEAF_NODE:
                 /* Add the match for this otn to the queue. */
                 {
-                    OptTreeNode *otn = (OptTreeNode *)node->option_data;
-                    PatternMatchData *pmd = (PatternMatchData *)eval_data->pmd;
-                    int pattern_size = 0;
-                    int check_ports = 1;
-                    int eval_rtn_result;
-#ifdef TARGET_BASED
-                    unsigned int svc_idx;
-#endif
+                    int pattern_size    = 0;
+                    int eval_rtn_result = 1;
+                    int check_ports     = 1;
+                    OptTreeNode *otn = (OptTreeNode*) node->option_data;
+                    PatternMatchData *pmd = (PatternMatchData*) eval_data->pmd;
 
-                    if (pmd)
+                    if (pmd) 
                         pattern_size = pmd->pattern_size;
-#ifdef TARGET_BASED
-                    if (eval_data->p->application_protocol_ordinal != 0)
-                    {
-                        for (svc_idx = 0;
-                             svc_idx < otn->sigInfo.num_services;
-                             svc_idx++)
-                        {
-                            if (otn->sigInfo.services[svc_idx].service_ordinal != 0)
-                            {
-                                if (eval_data->p->application_protocol_ordinal == otn->sigInfo.services[svc_idx].service_ordinal)
-                                {
-                                    check_ports = 0;
-                                    break; /* out of for */
-                                }
-                            }
-                        }
 
-                        if (otn->sigInfo.num_services && check_ports) /* none of the services match */
-                        {
-                            DEBUG_WRAP(DebugMessage(DEBUG_DETECT,
-                                "[**] SID %d not matched because of service mismatch (%d!=%d [**]\n",
-                                otn->sigInfo.id,
-                                eval_data->p->application_protocol_ordinal,
-                                otn->sigInfo.services[0].service_ordinal););
-                            break; /* out of case */
-                        }
+                    // See "detection_leaf_node.c" (detection_leaf_node_eval).
+#ifdef TARGET_BASED
+                    switch (detection_leaf_node_eval (node, eval_data))
+                    {
+                        case Leaf_Abort:
+                            eval_rtn_result = 0;
+                            break;
+
+                        case Leaf_SkipPorts:
+                            check_ports = 0;
+                            // fall through
+
+                        case Leaf_CheckPorts:
+                            NODE_PROFILE_TMPEND(node);
+                            eval_rtn_result = fpEvalRTN (getRuntimeRtnFromOtn (otn), eval_data->p, check_ports);
+                            NODE_PROFILE_TMPSTART(node);
+                            break;
                     }
 #endif
-                    // Don't include RTN time
-                    NODE_PROFILE_TMPEND(node);
-                    eval_rtn_result = fpEvalRTN(getRuntimeRtnFromOtn(otn), eval_data->p, check_ports);
-                    NODE_PROFILE_TMPSTART(node);
 
                     if (eval_rtn_result)
                     {
-                        if ( !otn->detection_filter ||
-                             !detection_filter_test(
+			    if ((!otn->detection_filter) ||
+                                 !detection_filter_test(
                                  otn->detection_filter,
                                  GET_SRC_IP(eval_data->p), GET_DST_IP(eval_data->p),
-                                 eval_data->p->pkth->ts.tv_sec) )
+                                 eval_data->p->pkth->ts.tv_sec, eval_data))
                         {
 #ifdef PERF_PROFILING
                             if (PROFILING_RULES)
@@ -1032,6 +1051,7 @@ int detection_option_node_evaluate(detection_option_tree_node_t *node, detection
                     }
                 }
                 break;
+
             case RULE_OPTION_TYPE_CONTENT:
                 if (node->evaluate)
                 {
@@ -1096,6 +1116,7 @@ int detection_option_node_evaluate(detection_option_tree_node_t *node, detection
             case RULE_OPTION_TYPE_BYTE_TEST:
             case RULE_OPTION_TYPE_BYTE_JUMP:
             case RULE_OPTION_TYPE_BYTE_EXTRACT:
+            case RULE_OPTION_TYPE_BYTE_MATH:
             case RULE_OPTION_TYPE_FLOW:
             case RULE_OPTION_TYPE_CVS:
             case RULE_OPTION_TYPE_DSIZE:
@@ -1128,9 +1149,7 @@ int detection_option_node_evaluate(detection_option_tree_node_t *node, detection
             case RULE_OPTION_TYPE_TTL:
             case RULE_OPTION_TYPE_URILEN:
             case RULE_OPTION_TYPE_HDR_OPT_CHECK:
-#if defined(FEAT_FILE_INSPECT)
             case RULE_OPTION_TYPE_FILE_TYPE:
-#endif
             case RULE_OPTION_TYPE_PREPROCESSOR:
                 if (node->evaluate)
                     rval = node->evaluate(node->option_data, eval_data->p);
@@ -1139,6 +1158,12 @@ int detection_option_node_evaluate(detection_option_tree_node_t *node, detection
                 if (node->evaluate)
                     rval = node->evaluate(node->option_data, eval_data->p);
                 break;
+#if defined(FEAT_OPEN_APPID)
+            case RULE_OPTION_TYPE_APPID:
+                if (node->evaluate)
+                    rval = node->evaluate(node->option_data, eval_data->p);
+                break;
+#endif /* defined(FEAT_OPEN_APPID) */
         }
 
         if (rval == DETECTION_OPTION_NO_MATCH)
@@ -1236,8 +1261,12 @@ int detection_option_node_evaluate(detection_option_tree_node_t *node, detection
 
                             /* Check for an unbounded relative search.  If this
                              * failed before, it's going to fail again so don't
-                             * go down this path again */
-                            if (pmd->within == 0)
+                             * go down this path again 
+                             * Check for protected pattern because in this case 
+                             * we had checked for 'n'bytes only where 'n' is the 
+                             * length of protected pattern.
+                             * */
+                            if (pmd->within == PMD_WITHIN_UNDEFINED && !pmd->protected_pattern)
                             {
                                 /* Only increment result once. Should hit this
                                  * condition on first loop iteration. */
@@ -1265,8 +1294,8 @@ int detection_option_node_evaluate(detection_option_tree_node_t *node, detection
                 if (child_node->option_type == RULE_OPTION_TYPE_LEAF_NODE)
                 {
                     /* Leaf node won't have any children but will return success
-                     * or failure */
-                    result += child_node->result;
+                     * or failure; regardless we must count them here */ 
+                    result += 1;
                 }
                 else if (child_node->result == child_node->num_children)
                 {
@@ -1309,10 +1338,13 @@ int detection_option_node_evaluate(detection_option_tree_node_t *node, detection
 
         if (result - prior_result > 0
             && node->option_type == RULE_OPTION_TYPE_CONTENT
-            && Replace_OffsetStored(&dup_content_option_data) && ScInlineMode())
+            && Replace_OffsetStored(&dup_content_option_data) && ScIpsInlineMode())
         {
+          if(!ScDisableReplaceOpt())
+          {
             Replace_QueueChange(&dup_content_option_data);
             prior_result = result;
+          }
         }
 
         NODE_PROFILE_TMPSTART(node);

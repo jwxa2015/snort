@@ -1,6 +1,6 @@
 /* $Id$ */
 /*
-** Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+** Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
 ** Copyright (C) 2002-2013 Sourcefire, Inc.
 ** Copyright (C) 1998-2002 Martin Roesch <roesch@sourcefire.com>
 **
@@ -108,6 +108,31 @@ void LogPriorityData(TextLog* log, bool doNewLine)
     if (doNewLine)
         TextLog_NewLine(log);
 }
+
+#if defined(FEAT_OPEN_APPID)
+/*--------------------------------------------------------------------
+ * Function: LogAppID()
+ *
+ * Purpose: Prints out AppID data associated with an alert
+ *
+ * Arguments: log => pointer to TextLog to write the data to
+ *            appName => name of app ID detected (if any)
+ *            doNewLine => tack a \n to the end of the line or not (bool)
+ *
+ * Returns: void function
+ *--------------------------------------------------------------------
+ */
+void LogAppID(TextLog* log, const char* appName, bool doNewLine)
+{
+    if (!appName || !appName[0])
+        return;
+
+    TextLog_Print(log, "[AppID: %s] ", appName);
+
+    if (doNewLine)
+        TextLog_NewLine(log);
+}
+#endif
 
 /*--------------------------------------------------------------------
  * Layer 2 header stuff cloned from log.c
@@ -648,7 +673,7 @@ static void LogOuterIPHeader(TextLog *log, Packet *p)
     IP4Hdr *save_ip4h = p->ip4h;
     IP6Hdr *save_ip6h = p->ip6h;
     uint8_t save_frag_flag = p->frag_flag;
-    uint16_t save_sp, save_dp;
+    uint16_t save_sp = 0, save_dp = 0;
 
     p->family = p->outer_family;
     p->iph_api = p->outer_iph_api;
@@ -737,6 +762,10 @@ static void LogTcpOptions(TextLog*  log, Packet * p)
 
             case TCPOPT_EOL:
                 TextLog_Puts(log, "EOL ");
+                break;
+
+            case TCPOPT_TFO:
+                TextLog_Puts(log, "TFO ");
                 break;
 
             case TCPOPT_NOP:
@@ -1201,8 +1230,8 @@ void LogICMPHeader(TextLog*  log, Packet * p)
             }
 
 /* written this way since inet_ntoa was typedef'ed to use sfip_ntoa
- * which requires sfip_t instead of inaddr's.  This call to inet_ntoa
- * is a rare case that doesn't use sfip_t's. */
+ * which requires sfcidr_t instead of inaddr's.  This call to inet_ntoa
+ * is a rare case that doesn't use sfcidr_t's. */
 
 // XXX-IPv6 NOT YET IMPLEMENTED - IPV6 addresses technically not supported - need to change ICMP
 
@@ -1388,7 +1417,7 @@ void LogXrefs(TextLog* log, bool doNewLine)
  * Returns: void function
  *--------------------------------------------------------------------
  */
-static void LogCharData(TextLog* log, char *data, int len)
+static void LogCharData(TextLog* log, const char *data, int len)
 {
     const char* pb = data;
     const char* end = data + len;
@@ -1587,10 +1616,26 @@ static int LogObfuscatedData(TextLog* log, Packet *p)
     {
         uint8_t buf[UINT16_MAX];
         uint16_t dlen = p->data - p->pkt;
+        int ret;
 
-        SafeMemcpy(buf, p->pkt, dlen, buf, buf + sizeof(buf));
-        SafeMemcpy(buf + dlen, payload, payload_len,
+        ret = SafeMemcpy(buf, p->pkt, dlen, buf, buf + sizeof(buf));
+        if (ret != SAFEMEM_SUCCESS)
+        {
+            DEBUG_WRAP(DebugMessage(DEBUG_LOG,
+                    "%s: SafeMemcpy() Failed !!!",  __FUNCTION__);)
+            free(payload);
+            return -1;
+        }
+
+        ret = SafeMemcpy(buf + dlen, payload, payload_len,
                 buf, buf + sizeof(buf));
+        if (ret != SAFEMEM_SUCCESS)
+        {
+            DEBUG_WRAP(DebugMessage(DEBUG_LOG,
+                    "%s: SafeMemcpy() Failed !!!",  __FUNCTION__);)
+            free(payload);
+            return -1;
+        }
 
         LogNetData(log, buf, dlen + payload_len, NULL);
     }
@@ -1711,12 +1756,12 @@ void LogIPPkt(TextLog* log, int type, Packet * p)
             if(!IsJSNormData(p->ssnptr))
             {
                 TextLog_Print(log, "%s\n", "Normalized JavaScript for this packet");
-                LogCharData(log, (char *)file_data_ptr.data, file_data_ptr.len);
+                LogCharData(log, (const char*)file_data_ptr.data, file_data_ptr.len);
             }
             else if(!IsGzipData(p->ssnptr))
             {
                 TextLog_Print(log, "%s\n", "Decompressed Data for this packet");
-                LogCharData(log, (char *)file_data_ptr.data, file_data_ptr.len);
+                LogCharData(log, (const char *)file_data_ptr.data, file_data_ptr.len);
             }
         }
         else
@@ -1755,4 +1800,71 @@ void LogArpHeader(TextLog* log, Packet * p)
 }
 #endif  // NO_NON_ETHER_DECODER
 
+#ifdef DUMP_BUFFER
+/*--------------------------------------------------------------------
+ * Function to dump the buffers used by snort during packet
+ * processing and inspection
+ *--------------------------------------------------------------------
+ */
 
+void LogBuffer(TextLog *log, char *name, char *data, const int len)
+{
+    int i = 0, j;
+    char conv[] = "0123456789ABCDEF";
+    TextLog_Print(log, "\n%s, %d\n", name, len);
+    while (i < len)
+    {
+        TextLog_Print(log, "\n%.8x  ",i);
+
+        for (j = 0; j < BYTES_PER_FRAME; j++)
+        {
+            if (j == (BYTES_PER_FRAME/2))
+            {
+                 TextLog_Putc(log, ' ');
+            }
+
+            if ((i+j) < len)
+            {
+	        char b = data[j + i];
+                TextLog_Putc(log, conv[(b & 0xFF) >> 4]);
+                TextLog_Putc(log, conv[(b & 0xFF) & 0x0F]);
+                TextLog_Putc(log, ' ');
+	    }
+
+            else
+            {
+                TextLog_Putc(log, ' ');
+                TextLog_Putc(log, ' ');
+                TextLog_Putc(log, ' ');
+            }
+	}
+
+        TextLog_Putc(log, ' ');
+        TextLog_Putc(log, '|');
+
+	for (j = 0; j < BYTES_PER_FRAME; j++)
+        {
+	    if ((i+j) < len)
+            {
+		char b = data[j + i];
+                if ( b > 0x1F && b < 0x7F)
+                {
+                    TextLog_Putc(log, (char)(b & 0xFF));
+		}
+                else
+                {
+                    TextLog_Putc(log, '.');
+		}
+	    }
+            else
+            {
+		TextLog_Putc(log, ' ');
+            }
+	}
+        TextLog_Putc(log, '|');
+	i = i + j;
+    }
+    TextLog_Putc(log, '\n');
+}
+
+#endif

@@ -1,6 +1,6 @@
 /****************************************************************************
  *
- * Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+ * Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
  * Copyright (C) 2005-2013 Sourcefire, Inc.
  *
  * This program is free software; you can redistribute it and/or modify
@@ -33,6 +33,7 @@
 #define __SMTP_CONFIG_H__
 
 #include "sfPolicyUserData.h"
+#include "file_mail_common.h"
 #include "sf_email_attach_decode.h"
 #include "file_api.h"
 
@@ -81,6 +82,7 @@
 #define CONF_BDATA_CMDS                  "binary_data_cmds"
 #define CONF_START_LIST "{"
 #define CONF_END_LIST   "}"
+#define CONF_MAX_AUTH_COMMAND_LINE_LEN   "max_auth_command_line_len"
 
 #define NORMALIZE_NONE 0
 #define NORMALIZE_CMDS 1
@@ -93,6 +95,7 @@
 #define DEFAULT_MAX_COMMAND_LINE_LEN    0
 #define DEFAULT_MAX_HEADER_LINE_LEN     0
 #define DEFAULT_MAX_RESPONSE_LINE_LEN   0
+#define DEFAULT_AUTH_MAX_COMMAND_LINE_LEN    1000
 
 /*These are temporary values*/
 #define MAX_DEPTH                     65535 
@@ -151,10 +154,9 @@ typedef struct _SMTPCmdConfig
 
 typedef struct _SMTPConfig
 {
-    char  ports[8192];
+    uint8_t ports[8192];
     char  inspection_type;
     char  normalize;
-    char  ignore_data;
     char  ignore_tls_data;
     int   max_command_line_len;
     int   max_header_line_len;
@@ -167,14 +169,8 @@ typedef struct _SMTPConfig
     char  enable_mime_decoding;
     MAIL_LogConfig log_config;
     uint32_t   memcap;
-    int   max_mime_mem;
     int   max_mime_depth; 
-    int max_depth;
-    int b64_depth;
-    int qp_depth;
-    int bitenc_depth;
-    int uu_depth;
-    int64_t file_depth;
+    DecodeConfig decode_conf;
 
     SMTPToken *cmds;
     SMTPCmdConfig *cmd_config;
@@ -188,6 +184,7 @@ typedef struct _SMTPConfig
     uint32_t xtra_mfrom_id;
     uint32_t xtra_rcptto_id;
     uint32_t xtra_ehdrs_id;
+    int max_auth_command_line_len;
 
 } SMTPConfig;
 
@@ -196,9 +193,9 @@ typedef struct _SMTP_Stats
     uint64_t sessions;
     uint64_t conc_sessions;
     uint64_t max_conc_sessions;
-    uint64_t memcap_exceeded;
-    uint64_t attachments[DECODE_ALL];
-    uint64_t decoded_bytes[DECODE_ALL];
+    uint64_t log_memcap_exceeded;
+    uint64_t cur_sessions;
+    MimeStats mime_stats;
 
 } SMTP_Stats;
 
@@ -209,7 +206,6 @@ void SMTP_ParseArgs(SMTPConfig *, char *);
 void SMTP_PrintConfig(SMTPConfig *config);
 
 void SMTP_CheckConfig(SMTPConfig *, tSfPolicyUserContextId);
-int SMTP_IsDecodingEnabled(SMTPConfig *pPolicyConfig);
 
 #endif
 

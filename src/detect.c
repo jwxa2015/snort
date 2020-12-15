@@ -1,7 +1,7 @@
 /* $Id$ */
 /*
 ** Copyright (C) 1998-2002 Martin Roesch <roesch@sourcefire.com>
-** Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+** Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
 ** Copyright (C) 2002-2013 Sourcefire, Inc.
 **    Dan Roelker <droelker@sourcefire.com>
 **    Marc Norton <mnorton@sourcefire.com>
@@ -51,7 +51,10 @@
 #include "event_queue.h"
 #include "obfuscation.h"
 #include "profiler.h"
+#include "session_api.h"
+#include "session_common.h"
 #include "stream_api.h"
+#include "snort_stream_udp.h"
 #include "active.h"
 #include "signature.h"
 #include "ipv6_port.h"
@@ -59,6 +62,11 @@
 #include "sf_types.h"
 #include "active.h"
 #include "detection_util.h"
+#include "preprocids.h"
+#if defined(FEAT_OPEN_APPID)
+#include "sp_appid.h"
+#include "appIdApi.h"
+#endif /* defined(FEAT_OPEN_APPID) */
 
 #ifdef PORTLISTS
 #include "sfutil/sfportobject.h"
@@ -67,16 +75,13 @@
 PreprocStats detectPerfStats;
 #endif
 
-extern int preproc_proto_mask;
-extern OutputFuncNode *AlertList;
-extern OutputFuncNode *LogList;
-
 #ifdef TARGET_BASED
 #include "target-based/sftarget_protocol_reference.h"
 #endif
 #include "sfPolicy.h"
 
 /* #define ITERATIVE_ENGINE */
+
 
 OptTreeNode *otn_tmp = NULL;       /* OptTreeNode temp ptr */
 
@@ -91,10 +96,118 @@ static int CheckTagging(Packet *);
 PreprocStats eventqPerfStats;
 #endif
 
+static inline int preprocHandlesProto( Packet *p, PreprocEvalFuncNode *ppn )
+{
+    return ( ( p->proto_bits & ppn->proto_mask ) || ( ppn->proto_mask == PROTO_BIT__ALL ) );
+}
+
+static inline bool processDecoderAlertsActionQ( Packet *p )
+{
+    // with policy selected, process any decoder alerts and queued actions
+    DecodePolicySpecific(p);
+    // actions are queued only for IDS case
+    sfActionQueueExecAll(decoderActionQ);
+    return true;
+}
+
+static void DispatchPreprocessors( Packet *p, tSfPolicyId policy_id, SnortPolicy *policy )
+{
+    SessionControlBlock *scb = NULL;
+    PreprocEvalFuncNode *ppn;
+    PreprocEnableMask pps_enabled_foo;
+    bool alerts_processed = false;
+
+#if defined(DAQ_VERSION) && DAQ_VERSION > 9
+    uint64_t start=0, end=0;
+#endif
+ 
+    // No expected sessions yet.
+    p->expectedSession = NULL;
+
+    // until we are in a Session context dispatch preprocs from the policy list if there is one
+    p->cur_pp = policy->preproc_eval_funcs;
+    if( p->cur_pp == NULL )
+    {
+        alerts_processed = processDecoderAlertsActionQ( p );
+        LogMessage("WARNING: No preprocessors configured for policy %d.\n", policy_id);
+        return;
+    }
+
+    pps_enabled_foo = policy->pp_enabled[ p->dp ] | policy->pp_enabled[ p->sp ];
+    EnablePreprocessors( p, pps_enabled_foo );
+    do {
+        ppn = p->cur_pp;
+        p->cur_pp = ppn->next;
+
+        // if packet has no data and we are up to APP preprocs then get out
+        if( p->dsize == 0 && ppn->priority >= PRIORITY_APPLICATION )
+            break;
+
+        if ( preprocHandlesProto( p, ppn ) && IsPreprocessorEnabled( p, ppn->preproc_bit ) )
+        {
+#if defined(DAQ_VERSION) && DAQ_VERSION > 9
+            if (p->pkth && (p->pkth->flags & DAQ_PKT_FLAG_DEBUG_ON))
+            {
+                get_clockticks(start);
+                ppn->func( p, ppn->context );
+                get_clockticks(end);
+                print_flow(p,NULL,ppn->preproc_id,start,end);
+            }
+            else
+                ppn->func( p, ppn->context );
+#else
+            ppn->func( p, ppn->context );
+#endif 
+        }
+
+
+        if( !alerts_processed && ( p->ips_os_selected || ppn->preproc_id == PP_FW_RULE_ENGINE ) )
+            alerts_processed = processDecoderAlertsActionQ( p );
+
+        if( scb == NULL && p->ssnptr != NULL )
+            scb = ( SessionControlBlock * ) p->ssnptr;
+        // if we now have session, update enabled pps if changed by previous preproc
+        if( scb != NULL && pps_enabled_foo != scb->enabled_pps )
+        {
+            EnablePreprocessors( p, scb->enabled_pps );
+            pps_enabled_foo = scb->enabled_pps;
+        }
+ 
+        if( ( ppn->preproc_id == PP_FW_RULE_ENGINE ) && 
+            ( ( IPH_IS_VALID( p ) ) && ( GET_IPH_PROTO( p ) == IPPROTO_UDP ) ) && 
+            ( session_api->protocol_tracking_enabled( SESSION_PROTO_UDP ) ) ) 
+        {
+            InspectPortFilterUdp( p );
+        }
+
+    } while ( ( p->cur_pp != NULL ) && !( p->packet_flags & PKT_PASS_RULE ) );
+
+    // queued decoder alerts are processed after the selection of the
+    // IPS rule config for the flow, if not yet done then process them now
+    if( !alerts_processed )
+        alerts_processed = processDecoderAlertsActionQ( p );
+
+    if( p->dsize == 0 )
+        DisableDetect( p );
+}
+
+
 int Preprocess(Packet * p)
 {
     int retval = 0;
-    tSfPolicyId policy_id = getRuntimePolicy();
+    int detect_retval = 0;
+    tSfPolicyId policy_id;
+
+   /* NAP runtime policy may have been updated during decode, 
+    * but preprocess needs default nap policy for session
+    * preprocessor selection, hence use default policy when
+    * called without session pointer set.
+    */
+    if( !p->ssnptr )
+        policy_id = getDefaultPolicy();
+    else
+        policy_id = getNapRuntimePolicy();
+
     SnortPolicy *policy = snort_conf->targeted_policies[policy_id];
 #ifdef PPM_MGR
     uint64_t pktcnt=0;
@@ -125,23 +238,26 @@ int Preprocess(Packet * p)
     }
 #endif
 
-    // If the packet has errors, we won't analyze it.
+    // If the packet has errors or syn over rate, we won't analyze it.
     if ( p->error_flags )
     {
+        // process any decoder alerts now that policy has been selected...
+        DecodePolicySpecific(p);
+
+        //actions are queued only for IDS case
+        sfActionQueueExecAll(decoderActionQ);
         DEBUG_WRAP(DebugMessage(DEBUG_DETECT,
             "Packet errors = 0x%x, ignoring traffic!\n", p->error_flags););
 
         if ( p->error_flags & PKT_ERR_BAD_TTL )
             pc.bad_ttl++;
+        else if( p->error_flags & PKT_ERR_SYN_RL_DROP )
+            pc.syn_rate_limit_drops++;
         else
             pc.invalid_checksums++;
     }
     else
     {
-        tSfPolicyId new_policy_id;
-        PreprocEvalFuncNode *new_idx;
-        PreprocEvalFuncNode *idx = policy->preproc_eval_funcs;
-
         /* Not a completely ideal place for this since any entries added on the
          * PacketCallback -> ProcessPacket -> Preprocess trail will get
          * obliterated - right now there isn't anything adding entries there.
@@ -159,105 +275,67 @@ int Preprocess(Packet * p)
         */
         ClearHttpBuffers();
         p->alt_dsize = 0;
-        DetectReset((uint8_t *)p->data, p->dsize);
+        DetectReset(p->data, p->dsize);
 
-        /* Turn on all preprocessors */
-        EnablePreprocessors(p);
+        // ok, dispatch all preprocs enabled for this packet/session
+        DispatchPreprocessors( p, policy_id, policy );
 
-        if ( p->dsize )
+        if ( do_detect ) 
         {
-            while ((idx != NULL) && !(p->packet_flags & PKT_PASS_RULE))
-            {
-                if ( (p->proto_bits & idx->proto_mask) &&
-                    IsPreprocBitSet(p, idx->preproc_bit))
-                {
-                    idx->func(p, idx->context);
-                    new_policy_id = getRuntimePolicy();
-                    if (new_policy_id != policy_id)
-                    {
-                        policy_id = new_policy_id;
-                        policy = snort_conf->targeted_policies[policy_id];
-                        if (!policy)
-                            break;
-                        for (new_idx = policy->preproc_eval_funcs; new_idx; new_idx = new_idx->next)
-                        {
-                            if (new_idx->func == idx->func)
-                            {
-                                new_idx = new_idx->next;
-                                break;
-                            }
-                            else if ((idx->next && new_idx->func == idx->next->func) || new_idx->priority > idx->priority)
-                                break;
-                        }
-                        idx = new_idx;
-                    }
-                    else
-                        idx = idx->next;
-                }
-                else
-                    idx = idx->next;
-
-                if ( !p->dsize )  // required with normalization
-                    break;
-            }
-        }
-        else
-        {
-            while ((idx != NULL) && !(p->packet_flags & PKT_PASS_RULE))
-            {
-                // short-circuit here if no app data
-                if ( idx->priority >= PRIORITY_APPLICATION )
-                {
-                    break;
-                }
-                if ( (p->proto_bits & idx->proto_mask) &&
-                    IsPreprocBitSet(p, idx->preproc_bit))
-                {
-                    idx->func(p, idx->context);
-                    new_policy_id = getRuntimePolicy();
-                    if (new_policy_id != policy_id)
-                    {
-                        policy_id = new_policy_id;
-                        policy = snort_conf->targeted_policies[policy_id];
-                        if (!policy)
-                            break;
-                        for (new_idx = policy->preproc_eval_funcs; new_idx; new_idx = new_idx->next)
-                        {
-                            if (new_idx->func == idx->func)
-                            {
-                                new_idx = new_idx->next;
-                                break;
-                            }
-                            else if ((idx->next && new_idx->func == idx->next->func) || new_idx->priority > idx->priority)
-                                break;
-                        }
-                        idx = new_idx;
-                    }
-                    else
-                        idx = idx->next;
-                }
-                else
-                    idx = idx->next;
-            }
-            DisableDetect(p);
-        }
-
-        if ( do_detect )
-        {
-            Detect(p);
+            detect_retval = Detect(p);
         }
     }
 
     check_tags_flag = 1;
 
+#ifdef DUMP_BUFFER
+    dumped_state = false;
+#endif
+
     PREPROC_PROFILE_START(eventqPerfStats);
     retval = SnortEventqLog(snort_conf->event_queue, p);
+
+#ifdef DUMP_BUFFER
+
+    /* dump_alert_only makes sure that bufferdump happens only when a rule is
+    triggered.
+
+    dumped_state avoids repetition of buffer dump for a packet that has an
+    alert, when --buffer-dump is given as command line option.
+
+    When --buffer-dump is given as command line option, BufferDump output
+    plugin is called for each packet. bdfptr will be NULL for all other output
+    plugins.
+    */
+
+    if (!dump_alert_only && !dumped_state)
+    {
+         OutputFuncNode *idx = LogList;
+
+         while (idx != NULL)
+         {
+             if (idx->bdfptr != NULL)
+                 idx->bdfptr(p, NULL , idx->arg, NULL);
+
+             idx = idx->next;
+         }
+     }
+#endif
+
     SnortEventqReset();
     PREPROC_PROFILE_END(eventqPerfStats);
 
     /* Check for normally closed session */
-    if(stream_api)
-        stream_api->check_session_closed(p);
+    if( session_api )
+        session_api->check_session_closed(p);
+
+    if( session_api && p->ssnptr &&
+      ( session_api->get_session_flags(p->ssnptr) & SSNFLAG_FREE_APP_DATA) )
+    {
+        SessionControlBlock *scb = ( SessionControlBlock * ) p->ssnptr;
+        session_api->free_application_data(scb);
+        scb->ha_state.session_flags &= ~SSNFLAG_FREE_APP_DATA;
+    }
 
     /*
     ** By checking tagging here, we make sure that we log the
@@ -290,6 +368,9 @@ int Preprocess(Packet * p)
             LogMessage("PPM: Process-EndPkt[%u]\n\n",(unsigned)pktcnt);
         }
 #endif
+       // When detection is required to happen and it is skipped , then only we will print the trace. 
+        if (do_detect && (!detect_retval)) 
+            PPM_LATENCY_TRACE();
 
         PPM_PKT_LOG(p);
     }
@@ -345,7 +426,58 @@ static int CheckTagging(Packet *p)
     return 0;
 }
 
-void CallLogFuncs(Packet *p, char *message, ListHead *head, Event *event)
+#if defined(FEAT_OPEN_APPID)
+static void updateEventAppName (Packet *p, OptTreeNode *otn, Event *event)
+{
+    const char *appName;
+    size_t appNameLen;
+    AppIdOptionData *app_data = (AppIdOptionData*)otn->ds_list[PLUGIN_APPID];
+
+    if (app_data && (app_data->matched_appid) && (appName = appIdApi.getApplicationName(app_data->matched_appid)))
+    {
+        appNameLen = strlen(appName);
+        if (appNameLen >= sizeof(event->app_name))
+            appNameLen = sizeof(event->app_name) - 1;
+        memcpy(event->app_name, appName, appNameLen);
+        event->app_name[appNameLen] = '\0';
+    }
+    else if (p->ssnptr)
+    {
+        //log most specific appid when rule didn't have any appId
+        int16_t serviceProtoId, clientProtoId, payloadProtoId, miscProtoId, pickedProtoId;
+
+        stream_api->get_application_id(p->ssnptr, &serviceProtoId, &clientProtoId, &payloadProtoId, &miscProtoId);
+        if ((p->packet_flags & PKT_FROM_CLIENT))
+        {
+            if (!(pickedProtoId = payloadProtoId) &&  !(pickedProtoId = miscProtoId) && !(pickedProtoId = clientProtoId))
+                pickedProtoId = serviceProtoId;
+        }
+        else
+        {
+            if (!(pickedProtoId = payloadProtoId) &&  !(pickedProtoId = miscProtoId) && !(pickedProtoId = serviceProtoId))
+                pickedProtoId = clientProtoId;
+        }
+
+        if ((pickedProtoId) && (appName = appIdApi.getApplicationName(pickedProtoId)))
+        {
+            appNameLen = strlen(appName);
+            if (appNameLen >= sizeof(event->app_name))
+                appNameLen = sizeof(event->app_name) - 1;
+            memcpy(event->app_name, appName, appNameLen);
+            event->app_name[appNameLen] = '\0';
+        }
+        else
+        {
+            event->app_name[0] = 0;
+        }
+    }
+    else
+    {
+        event->app_name[0] = 0;
+    }
+}
+#endif /* defined(FEAT_OPEN_APPID) */
+void CallLogFuncs(Packet *p, const char *message, ListHead *head, Event *event)
 {
     OutputFuncNode *idx = NULL;
 
@@ -375,7 +507,7 @@ void CallLogFuncs(Packet *p, char *message, ListHead *head, Event *event)
     }
 }
 
-void CallLogPlugins(Packet * p, char *message, Event *event)
+void CallLogPlugins(Packet * p, const char *message, Event *event)
 {
     OutputFuncNode *idx = LogList;
 
@@ -400,7 +532,7 @@ void CallSigOutputFuncs(Packet *p, OptTreeNode *otn, Event *event)
     }
 }
 
-void CallAlertFuncs(Packet * p, char *message, ListHead * head, Event *event)
+void CallAlertFuncs(Packet * p, const char *message, ListHead * head, Event *event)
 {
     OutputFuncNode *idx = NULL;
 
@@ -435,7 +567,7 @@ void CallAlertFuncs(Packet * p, char *message, ListHead * head, Event *event)
 }
 
 
-void CallAlertPlugins(Packet * p, char *message, Event *event)
+void CallAlertPlugins(Packet * p, const char *message, Event *event)
 {
     OutputFuncNode *idx = AlertList;
 
@@ -463,11 +595,20 @@ int Detect(Packet * p)
     int detected = 0;
     PROFILE_VARS;
 
+#if defined(DAQ_VERSION) && DAQ_VERSION > 9
+    uint64_t start = 0, end = 0;
+#endif
+
     if ((p == NULL) || !IPH_IS_VALID(p))
     {
         return 0;
     }
-
+    
+    if (stream_api && stream_api->is_session_http2(p->ssnptr) 
+        && !(p->packet_flags & PKT_REBUILT_STREAM)) 
+    {
+        return 0;
+    }
 
     if (!snort_conf->ip_proto_array[GET_IPH_PROTO(p)])
     {
@@ -520,7 +661,20 @@ int Detect(Packet * p)
     **  that we can do IP checks.
     */
     PREPROC_PROFILE_START(detectPerfStats);
+ #if defined(DAQ_VERSION) && DAQ_VERSION > 9
+    if (p->pkth && (p->pkth->flags & DAQ_PKT_FLAG_DEBUG_ON))
+    {
+        get_clockticks(start);
+        detected = fpEvalPacket(p);
+        get_clockticks(end);
+        print_flow(p,"DETECTION",0,start,end);
+    }
+    else
+        detected = fpEvalPacket(p);
+ #else
     detected = fpEvalPacket(p);
+#endif
+
     PREPROC_PROFILE_END(detectPerfStats);
 
     return detected;
@@ -549,8 +703,8 @@ int CheckAddrPort(
                 Packet *p,
                 uint32_t flags, int mode)
 {
-    snort_ip_p pkt_addr;              /* packet IP address */
-    u_short pkt_port;           /* packet port */
+    sfaddr_t* pkt_addr;              /* packet IP address */
+    u_short pkt_port;                /* packet port */
     int global_except_addr_flag = 0; /* global exception flag is set */
     int any_port_flag = 0;           /* any port flag set */
     int except_port_flag = 0;        /* port exception flag set */
@@ -710,7 +864,7 @@ void DumpList(IpAddrNode *idx, int negated)
     {
        DEBUG_WRAP(DebugMessage(DEBUG_RULES,
                         "[%d]    %s",
-                        i++, sfip_ntoa(idx->ip)););
+                        i++, sfip_ntoa(&idx->ip->addr)););
 
        if(negated)
        {
@@ -853,7 +1007,7 @@ int CheckSrcIP(Packet * p, struct _RuleTreeNode * rtn_idx, RuleFpList * fp_list,
 // XXX NOT YET IMPLEMENTED - debugging in Snort6
 #if 0
 #ifdef DEBUG_MSGS
-            sfip_t ip;
+            sfaddr_t ip;
             if(idx->addr_flags & EXCEPT_IP) {
                 DebugMessage(DEBUG_DETECT, "  SIP exception match\n");
             }
@@ -1106,49 +1260,21 @@ int PassAction(void)
     return 1;
 }
 
-int ActivateAction(Packet * p, OptTreeNode * otn, Event *event)
+int AlertAction(Packet * p, OptTreeNode * otn, RuleTreeNode * rtn, Event * event)
 {
-    RuleTreeNode *rtn = getRuntimeRtnFromOtn(otn);
-
-    DEBUG_WRAP(DebugMessage(DEBUG_DETECT,
-                   "        <!!> Activating and generating alert! \"%s\"\n",
-                   otn->sigInfo.message););
-    CallAlertFuncs(p, otn->sigInfo.message, rtn->listhead, event);
-
-    if (otn->OTN_activation_ptr == NULL)
+    if (!rtn)
     {
-        LogMessage("WARNING: an activation rule with no "
-                "dynamic rules matched.\n");
-        return 0;
+        // This function may be called from ppm, which doesn't do an RTN lookup
+        rtn = getRuntimeRtnFromOtn(otn);
+        if (!rtn)
+            return 0;
     }
 
-    otn->OTN_activation_ptr->active_flag = 1;
-    otn->OTN_activation_ptr->countdown =
-        otn->OTN_activation_ptr->activation_counter;
-
-    otn->RTN_activation_ptr->active_flag = 1;
-    otn->RTN_activation_ptr->countdown +=
-        otn->OTN_activation_ptr->activation_counter;
-
-    snort_conf->active_dynamic_nodes++;
-    DEBUG_WRAP(DebugMessage(DEBUG_DETECT,"   => Finishing activation packet!\n"););
-
-    CallLogFuncs(p, otn->sigInfo.message, rtn->listhead, event);
     DEBUG_WRAP(DebugMessage(DEBUG_DETECT,
-                "   => Activation packet finished, returning!\n"););
-
-    return 1;
-}
-
-int AlertAction(Packet * p, OptTreeNode * otn, Event *event)
-{
-    RuleTreeNode *rtn = getRuntimeRtnFromOtn(otn);
-
-    if (rtn == NULL)
-        return 0;
-
-    DEBUG_WRAP(DebugMessage(DEBUG_DETECT,
-                "        <!!> Generating alert! \"%s\", policyId %d\n", otn->sigInfo.message, getRuntimePolicy()););
+                "        <!!> Generating alert! \"%s\", policyId %d\n", otn->sigInfo.message, getIpsRuntimePolicy()););
+#if defined(FEAT_OPEN_APPID)
+    updateEventAppName (p, otn, event);
+#endif /* defined(FEAT_OPEN_APPID) */
 
     /* Call OptTreeNode specific output functions */
     if(otn->outputFuncs)
@@ -1182,23 +1308,25 @@ int AlertAction(Packet * p, OptTreeNode * otn, Event *event)
     return 1;
 }
 
-int DropAction(Packet * p, OptTreeNode * otn, Event *event)
+int DropAction(Packet * p, OptTreeNode * otn, RuleTreeNode * rtn, Event * event)
 {
-    RuleTreeNode *rtn = getRuntimeRtnFromOtn(otn);
-
     DEBUG_WRAP(DebugMessage(DEBUG_DETECT,
                "        <!!> Generating Alert and dropping! \"%s\"\n",
                otn->sigInfo.message););
 
     if(stream_api && !stream_api->alert_inline_midstream_drops())
     {
-        if(stream_api->get_session_flags(p->ssnptr) & SSNFLAG_MIDSTREAM)
+        if(session_api->get_session_flags(p->ssnptr) & SSNFLAG_MIDSTREAM)
         {
             DEBUG_WRAP(DebugMessage(DEBUG_DETECT,
                 " <!!> Alert Came From Midstream Session Silently Drop! "
                 "\"%s\"\n", otn->sigInfo.message););
 
             Active_DropSession(p);
+            if (pkt_trace_enabled)
+                addPktTraceData(VERDICT_REASON_SNORT, snprintf(trace_line, MAX_TRACE_LINE,
+                    "Snort: gid %u, sid %u, midstream %s\n", otn->sigInfo.generator, otn->sigInfo.id, getPktTraceActMsg()));
+            else addPktTraceData(VERDICT_REASON_SNORT, 0);
             return 1;
         }
     }
@@ -1208,15 +1336,22 @@ int DropAction(Packet * p, OptTreeNode * otn, Event *event)
     **  packet we just logged.
     */
     Active_DropSession(p);
+#if defined(FEAT_OPEN_APPID)
+    updateEventAppName (p, otn, event);
+#endif /* defined(FEAT_OPEN_APPID) */
 
     CallAlertFuncs(p, otn->sigInfo.message, rtn->listhead, event);
 
     CallLogFuncs(p, otn->sigInfo.message, rtn->listhead, event);
 
+    if (pkt_trace_enabled)
+        addPktTraceData(VERDICT_REASON_SNORT, snprintf(trace_line, MAX_TRACE_LINE,
+            "Snort detect_drop: gid %u, sid %u, %s\n", otn->sigInfo.generator, otn->sigInfo.id, getPktTraceActMsg()));
+    else addPktTraceData(VERDICT_REASON_SNORT, 0);
     return 1;
 }
 
-int SDropAction(Packet * p, OptTreeNode * otn, Event *event)
+int SDropAction(Packet * p, OptTreeNode * otn, Event * event)
 {
     DEBUG_WRAP(DebugMessage(DEBUG_DETECT,
                "        <!!> Dropping without Alerting! \"%s\"\n",
@@ -1224,44 +1359,15 @@ int SDropAction(Packet * p, OptTreeNode * otn, Event *event)
 
     // Let's silently drop the packet
     Active_DropSession(p);
-
+    if (pkt_trace_enabled)
+        addPktTraceData(VERDICT_REASON_SNORT, snprintf(trace_line, MAX_TRACE_LINE,
+            "Snort detect_sdrop: gid %u, sid %u, %s\n", otn->sigInfo.generator, otn->sigInfo.id, getPktTraceActMsg()));
+    else addPktTraceData(VERDICT_REASON_SNORT, 0);
     return 1;
 }
 
-int DynamicAction(Packet * p, OptTreeNode * otn, Event *event)
+int LogAction(Packet * p, OptTreeNode * otn, RuleTreeNode * rtn, Event * event)
 {
-    RuleTreeNode *rtn = getRuntimeRtnFromOtn(otn);
-
-    DEBUG_WRAP(DebugMessage(DEBUG_DETECT, "   => Logging packet data and"
-                            " adjusting dynamic counts (%d/%d)...\n",
-                            rtn->countdown, otn->countdown););
-
-    CallLogFuncs(p, otn->sigInfo.message, rtn->listhead, event);
-
-    otn->countdown--;
-
-    if( otn->countdown <= 0 )
-    {
-        otn->active_flag = 0;
-        snort_conf->active_dynamic_nodes--;
-        DEBUG_WRAP(DebugMessage(DEBUG_DETECT, "   <!!> Shutting down dynamic OTN node\n"););
-    }
-
-    rtn->countdown--;
-
-    if( rtn->countdown <= 0 )
-    {
-        rtn->active_flag = 0;
-        DEBUG_WRAP(DebugMessage(DEBUG_DETECT, "   <!!> Shutting down dynamic RTN node\n"););
-    }
-
-    return 1;
-}
-
-int LogAction(Packet * p, OptTreeNode * otn, Event *event)
-{
-    RuleTreeNode *rtn = getRuntimeRtnFromOtn(otn);
-
     DEBUG_WRAP(DebugMessage(DEBUG_DETECT,"   => Logging packet data and returning...\n"););
 
     CallLogFuncs(p, otn->sigInfo.message, rtn->listhead, event);

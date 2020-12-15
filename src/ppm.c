@@ -1,6 +1,6 @@
 /****************************************************************************
  *
- * Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+ * Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
  * Copyright (C) 2006-2013 Sourcefire, Inc.
  *
  * This program is free software; you can redistribute it and/or modify
@@ -357,7 +357,11 @@ void ppm_pkt_log(ppm_cfg_t *ppm_cfg, Packet* p)
                  potn->sigInfo.rev, /* Rev */
                  potn->sigInfo.class_id, /* classification */
                  potn->sigInfo.priority, /* priority (low) */
+#if !defined(FEAT_OPEN_APPID)
                  0);
+#else /* defined(FEAT_OPEN_APPID) */
+                 0, NULL);
+#endif /* defined(FEAT_OPEN_APPID) */
 
         if ( IPH_IS_VALID(p) )
         {
@@ -369,7 +373,7 @@ void ppm_pkt_log(ppm_cfg_t *ppm_cfg, Packet* p)
         }
         else
         {
-            snort_ip cleared;
+            sfaddr_t cleared;
             IP_CLEAR(cleared);
 
             filterEvent = sfthreshold_test(
@@ -382,7 +386,7 @@ void ppm_pkt_log(ppm_cfg_t *ppm_cfg, Packet* p)
         if(filterEvent < 0)
             filterEvent = 0;
         else
-            AlertAction(p, potn, &ev);
+            AlertAction(p, potn, NULL, &ev);
     }
 
     if (ppm_cfg->pkt_log & PPM_LOG_MESSAGE)
@@ -390,7 +394,7 @@ void ppm_pkt_log(ppm_cfg_t *ppm_cfg, Packet* p)
         char src[INET6_ADDRSTRLEN];
         char dst[INET6_ADDRSTRLEN];
 
-        sfip_t* addr = GET_SRC_IP(p);
+        sfaddr_t* addr = GET_SRC_IP(p);
         sfip_ntop(addr, src, sizeof(src));
 
         addr = GET_DST_IP(p);
@@ -419,7 +423,7 @@ void ppm_pkt_log(ppm_cfg_t *ppm_cfg, Packet* p)
 #define PPM_FMT_SUSPENDED "PPM: Rule-Event Pkt[" STDi64 "] address=0x%p used=%g usecs suspended %s\n"
 #define PPM_FMT_REENABLED "PPM: Rule-Event Pkt[" STDi64 "] address=0x%p re-enabled %s\n"
 
-static inline OptTreeNode * PPMGetOTN(uint32_t sid, char *msg)
+static inline OptTreeNode * PPMGetOTN(uint32_t sid, const char *msg)
 {
     OptTreeNode *otn = OtnLookup(snort_conf->otn_map, GENERATOR_PPM, sid);
 
@@ -433,7 +437,7 @@ static inline OptTreeNode * PPMGetOTN(uint32_t sid, char *msg)
     }
     else
     {
-        tSfPolicyId policy_id = getRuntimePolicy();
+        tSfPolicyId policy_id = getIpsRuntimePolicy();
 
         if ((getRtnFromOtn(otn, policy_id) == NULL)
                 && (GenerateSnortEventRtn(otn, policy_id) == NULL))
@@ -465,7 +469,7 @@ void ppm_rule_log(ppm_cfg_t *ppm_cfg, uint64_t pktcnt, Packet *p)
 
             if (otn != NULL)
             {
-                char *tmp = otn->sigInfo.message;
+                const char *tmp = otn->sigInfo.message;
 
                 SetEvent(&ev,
                         otn->sigInfo.generator, /* GID */
@@ -473,7 +477,11 @@ void ppm_rule_log(ppm_cfg_t *ppm_cfg, uint64_t pktcnt, Packet *p)
                         otn->sigInfo.rev, /* Rev */
                         otn->sigInfo.class_id, /* classification */
                         otn->sigInfo.priority, /* priority (low) */
+#if !defined(FEAT_OPEN_APPID)
                         0);
+#else /* defined(FEAT_OPEN_APPID) */
+                        0, NULL);
+#endif /* defined(FEAT_OPEN_APPID) */
 
                 otn->sigInfo.message = PPM_EVENT_RULE_TREE_ENABLED_STR;
                 if ( IPH_IS_VALID(p) )
@@ -486,7 +494,7 @@ void ppm_rule_log(ppm_cfg_t *ppm_cfg, uint64_t pktcnt, Packet *p)
                 }
                 else
                 {
-                    snort_ip cleared;
+                    sfaddr_t cleared;
                     IP_CLEAR(cleared);
 
                     filterEvent = sfthreshold_test(
@@ -499,7 +507,7 @@ void ppm_rule_log(ppm_cfg_t *ppm_cfg, uint64_t pktcnt, Packet *p)
                 if(filterEvent < 0)
                     filterEvent = 0;
                 else
-                    AlertAction(p, otn, &ev);
+                    AlertAction(p, otn, NULL, &ev);
 
                 otn->sigInfo.message = tmp;
             }
@@ -535,7 +543,7 @@ void ppm_rule_log(ppm_cfg_t *ppm_cfg, uint64_t pktcnt, Packet *p)
 
             if (otn != NULL)
             {
-                char *tmp = otn->sigInfo.message;
+                const char *tmp = otn->sigInfo.message;
 
                 SetEvent(&ev,
                         otn->sigInfo.generator, /* GID */
@@ -543,7 +551,11 @@ void ppm_rule_log(ppm_cfg_t *ppm_cfg, uint64_t pktcnt, Packet *p)
                         otn->sigInfo.rev, /* Rev */
                         otn->sigInfo.class_id, /* classification */
                         otn->sigInfo.priority, /* priority (low) */
+#if !defined(FEAT_OPEN_APPID)
                         0);
+#else /* defined(FEAT_OPEN_APPID) */
+                        0, NULL);
+#endif /* defined(FEAT_OPEN_APPID) */
 
                 otn->sigInfo.message = PPM_EVENT_RULE_TREE_DISABLED_STR;
                 if ( IPH_IS_VALID(p) )
@@ -556,7 +568,7 @@ void ppm_rule_log(ppm_cfg_t *ppm_cfg, uint64_t pktcnt, Packet *p)
                 }
                 else
                 {
-                    snort_ip cleared;
+                    sfaddr_t cleared;
                     IP_CLEAR(cleared);
 
                     filterEvent = sfthreshold_test(
@@ -569,7 +581,7 @@ void ppm_rule_log(ppm_cfg_t *ppm_cfg, uint64_t pktcnt, Packet *p)
                 if(filterEvent < 0)
                     filterEvent = 0;
                 else
-                    AlertAction(p, otn, &ev);
+                    AlertAction(p, otn, NULL, &ev);
                 otn->sigInfo.message = tmp;
             }
         }
@@ -580,7 +592,7 @@ void ppm_rule_log(ppm_cfg_t *ppm_cfg, uint64_t pktcnt, Packet *p)
             char src[INET6_ADDRSTRLEN];
             char dst[INET6_ADDRSTRLEN];
 
-            sfip_t* addr = GET_SRC_IP(p);
+            sfaddr_t* addr = GET_SRC_IP(p);
             sfip_ntop(addr, src, sizeof(src));
 
             addr = GET_DST_IP(p);

@@ -1,6 +1,6 @@
 /****************************************************************************
  *
- * Copyright (C) 2014 Cisco and/or its affiliates. All rights reserved.
+ * Copyright (C) 2014-2020 Cisco and/or its affiliates. All rights reserved.
  * Copyright (C) 2003-2013 Sourcefire, Inc.
  *
  * This program is free software; you can redistribute it and/or modify
@@ -131,15 +131,20 @@ unsigned char * hbm_match(HBM_STRUCT * px, unsigned char *text, int n)
     q = t - m1;
     while( k >= 4 )
     {
-      if( pat[k] != q[k] )goto NoMatch;  k--;
-      if( pat[k] != q[k] )goto NoMatch;  k--;
-      if( pat[k] != q[k] )goto NoMatch;  k--;
-      if( pat[k] != q[k] )goto NoMatch;  k--;
+      if( pat[k] != q[k] ) goto NoMatch;
+      k--;
+      if( pat[k] != q[k] ) goto NoMatch;
+      k--;
+      if( pat[k] != q[k] ) goto NoMatch;
+      k--;
+      if( pat[k] != q[k] ) goto NoMatch;
+      k--;
     }
     /* Finish Match Loop */
     while( k >= 0 )
     {
-      if( pat[k] != q[k] )goto NoMatch;  k--;
+      if( pat[k] != q[k] ) goto NoMatch;
+      k--;
     }
     /* If matched - return 1st char of pattern in text */
     return q;
