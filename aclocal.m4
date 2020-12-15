@@ -1383,7 +1383,7 @@ mips64*-*linux*)
   rm -rf conftest*
   ;;
 
-x86_64-*kfreebsd*-gnu|x86_64-*linux*|ppc*-*linux*|powerpc*-*linux*| \
+x86_64-*kfreebsd*-gnu|x86_64-*linux*|powerpc*-*linux*| \
 s390*-*linux*|s390*-*tpf*|sparc*-*linux*)
   # Find out what ABI is being produced by ac_compile, and set linker
   # options accordingly.  Note that the listed cases only cover the
@@ -1412,7 +1412,7 @@ s390*-*linux*|s390*-*tpf*|sparc*-*linux*)
 	  powerpc64le-*linux*)
 	    LD="${LD-ld} -m elf32lppclinux"
 	    ;;
-	  ppc64-*linux*|powerpc64-*linux*)
+	  powerpc64-*linux*)
 	    LD="${LD-ld} -m elf32ppclinux"
 	    ;;
 	  s390x-*linux*)
